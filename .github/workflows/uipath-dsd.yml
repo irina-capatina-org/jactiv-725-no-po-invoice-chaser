@@ -1,0 +1,1011 @@
+name: uipath-dsd
+
+# Stage 5 of the ADLC chain, as six visible jobs:
+#
+#   Identify build -> Read build -> Generate DSD -> Open PR -> Merge -> Promote to main
+#
+# Maestro creates branch  docs-<dsdStoryKey>  from develop. Creating the branch IS the
+# trigger.
+#
+# ── POSITION MATTERS: Docs runs AFTER Development ─────────────────────────────
+# Because this stage now runs after the code is merged, the DSD is AS-BUILT
+# documentation, not a build spec. Nobody needs a spec for work that is already
+# done; what is needed is a document that says what was actually delivered, how it
+# runs, and what to do when it breaks. So this stage reads the CODE as its primary
+# input and the SDD only as the design it is measured against.
+#
+# That also fixes the one thing it must get right: every claim in the DSD has to be
+# true of the code on disk. The validator enforces that literally - a file path the
+# DSD references must exist.
+#
+# ── This stage AUTO-MERGES, then opens the promotion PR ───────────────────────
+# The DSD PR is merged by this workflow (no human gate - the human gate for the whole
+# release is the develop -> main PR). Once it lands, the last job opens the
+# develop -> main promotion PR and assigns it. Merging THAT is the release approval,
+# and it is what triggers uipath-deploy.
+#
+# Jira is NOT touched from here - Flow owns every Jira transition in this chain.
+
+on:
+  push:
+    branches:
+      - 'docs**'
+  workflow_dispatch:
+    inputs:
+      skip_promote:
+        description: 'Write and merge the DSD but do not open the develop -> main PR'
+        required: false
+        default: false
+        type: boolean
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  DOCS_DIR: docs
+  CODE_DIR: code
+  BASE_BRANCH: develop
+  RELEASE_BRANCH: main
+  ASSIGNEE: irina-capatina-uipath
+  AGENT_MODEL: claude-sonnet-4-6
+  CLI_VERSION: '1.202.0'
+  # Floor for the whole document, not per section: validate-dsd.sh no longer has a
+  # section contract to scale against. Below this it is a stub, not a page to show.
+  MIN_DSD_BYTES: '1200'
+  WORK_DIR: build-work
+
+permissions:
+  contents: write
+  pull-requests: write
+  id-token: write
+
+concurrency:
+  group: dsd-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+
+  # ═══════════════════════════════════════════════════════════════
+  # 1. Identify build
+  # The code is the subject of this document, so its absence is fatal here in a way
+  # it never was for the earlier stages.
+  # ═══════════════════════════════════════════════════════════════
+  identify:
+    name: Identify build
+    runs-on: ubuntu-latest
+    outputs:
+      branch:     ${{ steps.resolve.outputs.branch }}
+      file_key:   ${{ steps.resolve.outputs.file_key }}
+      story_key:  ${{ steps.resolve.outputs.story_key }}
+      arch_file:  ${{ steps.resolve.outputs.arch_file }}
+      sdd_files:  ${{ steps.resolve.outputs.sdd_files }}
+      pdd_files:  ${{ steps.resolve.outputs.pdd_files }}
+      dsd_plan:   ${{ steps.resolve.outputs.dsd_plan }}
+      dsd_files:  ${{ steps.resolve.outputs.dsd_files }}
+      prior_dsds: ${{ steps.resolve.outputs.prior_dsds }}
+      revision:   ${{ steps.resolve.outputs.revision }}
+      product:    ${{ steps.resolve.outputs.product }}
+      scope:      ${{ steps.resolve.outputs.scope }}
+      skills:     ${{ steps.resolve.outputs.skills }}
+      code_files: ${{ steps.resolve.outputs.code_files }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+          fetch-depth: 0
+
+      - name: Observe - Documentation in progress
+        # A dashboard write must never fail the pipeline: observe.sh uses `set -e`, so
+        # a rate limit or a transient 5xx would otherwise take a good stage down with it.
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO:     ${{ github.repository }}
+        run: |
+          bash .github/scripts/observe.sh stage Documentation status=in-progress \
+            task="Writing the as-built DSD" run=${{ github.run_id }}
+
+      - name: Resolve the delivered build
+        id: resolve
+        run: |
+          set -euo pipefail
+
+          BRANCH="${GITHUB_REF#refs/heads/}"
+          FILE_KEY="${BRANCH#*-}"
+          if [ -z "$FILE_KEY" ] || [ "$FILE_KEY" = "$BRANCH" ]; then
+            echo "::error::Branch '$BRANCH' has no key after a 'docs-' prefix."
+            exit 1
+          fi
+          STORY_KEY=$(echo "$FILE_KEY" | tr '[:lower:]' '[:upper:]')
+
+          if [ ! -d "$DOCS_DIR" ]; then
+            echo "::error::No $DOCS_DIR folder on branch $BRANCH."
+            exit 1
+          fi
+
+          # ── the code is the subject of this document ──────────────────────────
+          if [ ! -d "$CODE_DIR" ]; then
+            echo "::error::No $CODE_DIR/ on branch $BRANCH - there is no build to document."
+            echo "::error::Docs runs after Development: the implementation PR must be merged into $BASE_BRANCH first."
+            exit 1
+          fi
+          CODE_COUNT=$(find "$CODE_DIR" -type f -not -name 'README.md' 2>/dev/null | wc -l | tr -d ' ')
+          if [ "${CODE_COUNT:-0}" -eq 0 ]; then
+            echo "::error::$CODE_DIR/ is empty on branch $BRANCH - there is no build to document."
+            exit 1
+          fi
+          CODE_FILES=$(find "$CODE_DIR" -maxdepth 4 -type f \
+                         \( -name 'project.json' -o -name 'project.uiproj' -o -name 'Workflow.json' \
+                         -o -name '*.xaml' -o -name 'agent.json' -o -name 'uipath.json' \
+                         -o -name '*.flow' -o -name 'caseplan.json' -o -name 'entry-points.json' \) \
+                       | sort | tr '\n' ' ' | sed 's/ *$//')
+          if [ -z "$CODE_FILES" ]; then
+            echo "::error::No recognisable UiPath project file under $CODE_DIR/ - nothing to document."
+            find "$CODE_DIR" -type f | head -30
+            exit 1
+          fi
+
+          # The architecture contract lives at a fixed repository-based name -
+          # architecture-<repo>.json - because the lifecycle updates ONE contract in
+          # place rather than writing a new one per story key. See uipath-sdd.yml.
+          REPO_NAME="${GITHUB_REPOSITORY##*/}"
+          ARCH_FILE="$DOCS_DIR/architecture-$REPO_NAME.json"
+
+          # Fallback for a repo not yet migrated: newest key-named file wins, as before.
+          if [ ! -f "$ARCH_FILE" ]; then
+            while IFS= read -r f; do
+              [ -n "$f" ] || continue
+              printf '%s\t%s\n' "$(git log -1 --format=%ct -- "$f" 2>/dev/null || echo 0)" "$f"
+            done < <(find "$DOCS_DIR" -maxdepth 1 -type f -name 'architecture-*.json' 2>/dev/null | sort) \
+              > /tmp/arch-index.tsv
+            ARCH_FILE=$(sort -t"$(printf '\t')" -k1,1n -k2,2 /tmp/arch-index.tsv | cut -f2- | tail -1 || true)
+            [ -n "${ARCH_FILE:-}" ] && echo "::warning::Using legacy '$ARCH_FILE'; the canonical name is $DOCS_DIR/architecture-$REPO_NAME.json."
+          fi
+          if [ -z "${ARCH_FILE:-}" ]; then
+            echo "::error::No $DOCS_DIR/architecture-*.json on branch $BRANCH."
+            exit 1
+          fi
+          python3 -c "import json,sys;json.load(open(sys.argv[1]))" "$ARCH_FILE" \
+            || { echo "::error::$ARCH_FILE is not valid JSON."; exit 1; }
+
+          PRODUCT=$(python3 -c "import json;print(json.load(open('$ARCH_FILE'))['primary_product'])")
+          SCOPE=$(python3   -c "import json;print(json.load(open('$ARCH_FILE'))['sdd_scope'])")
+          SDD_FILES=$(python3 -c "import json;print(' '.join(f['path'] for f in json.load(open('$ARCH_FILE'))['sdd_files']))")
+          SKILLS=$(python3 -c "
+          import json
+          d=json.load(open('$ARCH_FILE')); seen=[]
+          for p in sorted(d['projects'], key=lambda x: x.get('build_order',99)):
+              s=p.get('skill','')
+              if s and s not in seen: seen.append(s)
+          print(' '.join(seen))")
+
+          for f in $SDD_FILES; do
+            [ -f "$f" ] || { echo "::error::$ARCH_FILE declares $f, which is not on this branch."; exit 1; }
+          done
+
+          # One DSD per buildable project; component rows are documented inside their host.
+          # DSD names come from the REPOSITORY, never the process name - dsd-<repo>.md
+          # for a single product, dsd-<repo>-<project-kebab>.md per project for a
+          # solution. Same rule as the PDD and SDD: the process name is not unique
+          # across the estate and changes when the process is renamed, whereas the
+          # repository name is stable for the whole lifecycle.
+          DSD_PLAN=$(python3 - "$ARCH_FILE" "$REPO_NAME" <<'EOF_PLAN'
+          import json, sys
+          d = json.load(open(sys.argv[1]))
+          repo = sys.argv[2]
+          rows, seen = [], set()
+          for p in sorted(d["projects"], key=lambda x: x.get("build_order", 99)):
+              if p.get("role") == "component":
+                  continue
+              kebab = p.get("kebab") or p["name"].lower().replace(".", "-")
+              sdd = p.get("sdd_file", "")
+              key = sdd or kebab
+              if key in seen:
+                  continue
+              seen.add(key)
+              path = (f"docs/dsd-{repo}.md" if d["sdd_scope"] == "single-product"
+                      else f"docs/dsd-{repo}-{kebab}.md")
+              rows.append("\t".join([path, sdd, p.get("product", ""), p.get("skill", ""), p["name"]]))
+          print("\n".join(rows))
+          EOF_PLAN
+          )
+          [ -n "$DSD_PLAN" ] || { echo "::error::$ARCH_FILE yielded no buildable project."; exit 1; }
+          printf '%s\n' "$DSD_PLAN" > /tmp/dsd-plan.tsv
+          DSD_FILES=$(cut -f1 /tmp/dsd-plan.tsv | tr '\n' ' ' | sed 's/ *$//')
+
+          # Both name shapes, so a repo mid-migration still finds its existing DSD and
+          # updates it rather than writing a second one under the new name.
+          PRIOR_DSDS=$(find "$DOCS_DIR" -maxdepth 1 -type f \
+                         \( -iname 'dsd-*.md' -o -iname '*-dsd.md' \) 2>/dev/null \
+                       | sort -u | tr '\n' ' ' | sed 's/ *$//' || true)
+          PRIOR_COUNT=$(printf '%s' "${PRIOR_DSDS:-}" | wc -w | tr -d ' ')
+          REVISION=$(( PRIOR_COUNT > 0 ? 2 : 1 ))
+
+          PDD_FILES=$(find "$DOCS_DIR" -maxdepth 1 -type f \
+                        \( -iname 'pdd-*.md' -o -iname '*-pdd.md' \) 2>/dev/null \
+                      | sort | tr '\n' ' ' | sed 's/ *$//' || true)
+
+          {
+            echo "branch=$BRANCH"
+            echo "file_key=$FILE_KEY"
+            echo "story_key=$STORY_KEY"
+            echo "arch_file=$ARCH_FILE"
+            echo "sdd_files=$SDD_FILES"
+            echo "pdd_files=$PDD_FILES"
+            echo "dsd_files=$DSD_FILES"
+            echo "prior_dsds=$PRIOR_DSDS"
+            echo "revision=$REVISION"
+            echo "product=$PRODUCT"
+            echo "scope=$SCOPE"
+            echo "skills=$SKILLS"
+            echo "code_files=$CODE_FILES"
+            echo "dsd_plan<<EOF_PLAN_OUT"
+            cat /tmp/dsd-plan.tsv
+            echo "EOF_PLAN_OUT"
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### 1. Delivered build identified"
+            echo ""
+            echo "| Field | Value |"
+            echo "| --- | --- |"
+            echo "| Branch | \`$BRANCH\` |"
+            echo "| Story key | \`$STORY_KEY\` |"
+            echo "| Architecture | \`$ARCH_FILE\` |"
+            echo "| Scope / product | \`$SCOPE\` / \`$PRODUCT\` |"
+            echo "| Files under \`$CODE_DIR/\` | $CODE_COUNT |"
+            echo "| Run type | $([ "$REVISION" -gt 1 ] && echo 'revision (change request)' || echo 'initial DSD') |"
+            echo ""
+            echo "Project files being documented:"
+            echo ""
+            for f in $CODE_FILES; do echo "- \`$f\`"; done
+            echo ""
+            echo "| DSD | Measured against | Product |"
+            echo "| --- | --- | --- |"
+            while IFS=$'\t' read -r p s prod sk n; do echo "| \`$p\` | \`$s\` | $prod |"; done < /tmp/dsd-plan.tsv
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "Documenting $CODE_COUNT file(s) under $CODE_DIR/"
+          echo "DSD files: $DSD_FILES"
+
+  # ═══════════════════════════════════════════════════════════════
+  # 2. Read build
+  # ═══════════════════════════════════════════════════════════════
+  read-build:
+    name: Read build
+    needs: identify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.identify.outputs.branch }}
+          fetch-depth: 1
+
+      - name: Assemble the build corpus
+        env:
+          ARCH_FILE:  ${{ needs.identify.outputs.arch_file }}
+          SDD_FILES:  ${{ needs.identify.outputs.sdd_files }}
+          PDD_FILES:  ${{ needs.identify.outputs.pdd_files }}
+          PRIOR_DSDS: ${{ needs.identify.outputs.prior_dsds }}
+          REVISION:   ${{ needs.identify.outputs.revision }}
+          STORY_KEY:  ${{ needs.identify.outputs.story_key }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$WORK_DIR/sdd" "$WORK_DIR/pdd" "$WORK_DIR/prior"
+          cp "$ARCH_FILE" "$WORK_DIR/architecture.json"
+
+          SDD_ROWS=""
+          for f in $SDD_FILES; do
+            cp "$f" "$WORK_DIR/sdd/$(basename "$f")"
+            SDD_ROWS="$SDD_ROWS{\"path\":\"$f\",\"local\":\"$WORK_DIR/sdd/$(basename "$f")\"},"
+          done
+          PDD_ROWS=""
+          for f in ${PDD_FILES:-}; do
+            cp "$f" "$WORK_DIR/pdd/$(basename "$f")"
+            PDD_ROWS="$PDD_ROWS\"$WORK_DIR/pdd/$(basename "$f")\","
+          done
+          PRIOR_ROWS=""
+          for f in ${PRIOR_DSDS:-}; do
+            cp "$f" "$WORK_DIR/prior/$(basename "$f")"
+            PRIOR_ROWS="$PRIOR_ROWS\"$f\","
+          done
+
+          # An inventory of the delivered build, so the agent starts from what exists
+          # rather than from what the design said would exist.
+          find "$CODE_DIR" -type f | sort > "$WORK_DIR/code-inventory.txt"
+          CODE_TOTAL=$(wc -l < "$WORK_DIR/code-inventory.txt" | tr -d ' ')
+
+          # The build notes from the Development stage record deviations and TODOs -
+          # the two things as-built documentation most often gets wrong by omission.
+          BUILD_NOTES=""
+          if [ -f "$CODE_DIR/build-notes.md" ]; then
+            cp "$CODE_DIR/build-notes.md" "$WORK_DIR/build-notes.md"
+            BUILD_NOTES="$WORK_DIR/build-notes.md"
+          else
+            echo "::warning::No $CODE_DIR/build-notes.md - deviations and open TODOs will have to be inferred from the code."
+          fi
+
+          cat > "$WORK_DIR/manifest.json" <<EOF_MANIFEST
+          {
+            "story_key": "$STORY_KEY",
+            "revision": $REVISION,
+            "architecture": "$WORK_DIR/architecture.json",
+            "code_inventory": "$WORK_DIR/code-inventory.txt",
+            "code_file_count": $CODE_TOTAL,
+            "build_notes": "$BUILD_NOTES",
+            "sdds": [${SDD_ROWS%,}],
+            "pdds": [${PDD_ROWS%,}],
+            "prior_dsds": [${PRIOR_ROWS%,}]
+          }
+          EOF_MANIFEST
+          python3 -c "import json;json.load(open('$WORK_DIR/manifest.json'))" \
+            || { echo "::error::manifest.json is not valid JSON"; cat "$WORK_DIR/manifest.json"; exit 1; }
+
+          {
+            echo "### 2. Build read"
+            echo ""
+            echo "${CODE_TOTAL} file(s) inventoried under \`$CODE_DIR/\`."
+            echo ""
+            echo '```json'
+            cat "$WORK_DIR/manifest.json"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dsd-inputs
+          path: ${{ env.WORK_DIR }}
+          retention-days: 1
+          if-no-files-found: error
+
+  # ═══════════════════════════════════════════════════════════════
+  # 3. Generate DSD
+  # ═══════════════════════════════════════════════════════════════
+  generate-dsd:
+    name: Generate DSD
+    needs: [identify, read-build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.identify.outputs.branch }}
+          fetch-depth: 1
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: dsd-inputs
+          path: ${{ env.WORK_DIR }}
+
+      - name: Install UiPath skills
+        continue-on-error: true
+        run: |
+          set -uo pipefail
+          npm i -g "@uipath/cli@${CLI_VERSION}" || { echo "::warning::@uipath/cli install failed"; exit 1; }
+          # --path must already exist; the CLI refuses to create it and fails with
+          # "Path does not exist or is not a directory".
+          mkdir -p "$RUNNER_TEMP/uip-skills"
+          uip skills install --agent codex --path "$RUNNER_TEMP/uip-skills" \
+            || { echo "::warning::uip skills install failed"; exit 1; }
+          mkdir -p "$HOME/.claude/skills"
+          cp -R "$RUNNER_TEMP/uip-skills/.agents/skills/." "$HOME/.claude/skills/"
+          ls -1 "$HOME/.claude/skills"
+
+      - name: Run uipath-documenter agent
+        uses: anthropics/claude-code-base-action@beta
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          model: ${{ env.AGENT_MODEL }}
+          timeout_minutes: '45'
+          allowed_tools: "Read,Write,Edit,Glob,Grep,Bash,Skill"
+          prompt: |
+            You are uipath-documenter. The automation is built, tested and merged. Your job
+            is the Detailed Solution Design as AS-BUILT DOCUMENTATION: what was actually
+            delivered, how it runs, and what to do when it breaks.
+
+            Build corpus:   ${{ env.WORK_DIR }}/manifest.json  (read this first)
+            Code inventory: ${{ env.WORK_DIR }}/code-inventory.txt
+            The code:       ${{ env.CODE_DIR }}/  (READ IT - it is the subject)
+            Build notes:    ${{ env.WORK_DIR }}/build-notes.md  (may be absent)
+            Architecture:   ${{ env.WORK_DIR }}/architecture.json
+            Prior DSD(s):   ${{ env.WORK_DIR }}/prior/  (empty on a first write)
+            Story key:      ${{ needs.identify.outputs.story_key }}
+            Revision:       ${{ needs.identify.outputs.revision }}
+            Scope:          ${{ needs.identify.outputs.scope }}
+                            (`single-product` = ONE API Workflow project inside a
+                             UiPath Solution; the delivery is always a solution)
+            Primary:        ${{ needs.identify.outputs.product }}
+            Build skills:   ${{ needs.identify.outputs.skills }}
+            Today:          run `date +%F` and use that as the generation date.
+
+            Write EXACTLY these files, one per line as `path <TAB> measured-against-SDD
+            <TAB> product <TAB> skill <TAB> project`:
+
+            ${{ needs.identify.outputs.dsd_plan }}
+
+            ## The one rule that matters
+
+            **Document what IS, not what was designed.** This stage runs after the build,
+            so the code on disk is the truth and the SDD is only what was intended. Every
+            statement you write must be checkable against a file under
+            ${{ env.CODE_DIR }}/. Where the build differs from the SDD, the build is what
+            you document. Where it differs from the SDD in a way that changes how the thing
+            is operated, say so in one line in As-Built Architecture.
+
+            The validator checks this literally: every `code/...` path you reference must
+            exist on disk. A DSD that describes the design instead of the delivery will
+            fail it.
+
+            ## Step 0 - load the specialist skill
+
+            Run `ls ~/.claude/skills`. For every skill in Build skills, READ
+            `~/.claude/skills/<skill-name>/SKILL.md` with the Read tool - it tells you how
+            to read that product's project files correctly, which you need in order to
+            describe them accurately.
+
+            NEVER load a skill through the Task tool. Spawning a subagent fails in this
+            runner: it resolves a retired model id and comes back
+            `404 not_found_error - model: claude-sonnet-4-20250514`, so you lose the skill
+            entirely. Read SKILL.md with the Read tool, and read the reference files it
+            points at the same way.
+
+
+            ## Step 1 - read the code first
+
+            Read the manifest, then the code inventory, then EVERY project file it lists.
+            Only after that read the SDD and the architecture json. That order matters: if
+            you read the design first you will describe the design.
+
+            Read the build notes if present - its *Deviations from the SDD* and *Left for a
+            human* sections are the two things as-built documentation most often misses.
+            Carry every open TODO forward into the Operations Runbook's prerequisites,
+            each with its file path.
+
+            On a revision run, read every prior DSD and UPDATE it in place: keep the
+            structure, change what the new build changed, add a Document History row
+            (version +0.1, or +1.0 when the architecture moved) naming the change request.
+
+            ## Step 2 - write each DSD
+
+            Front matter, in this order, for EVERY file:
+
+                # Detailed Solution Design — <project name>
+
+                ## Document History
+
+                | Date | Version | Author | Role | Comments |
+                (one row per revision, newest last)
+
+                <!-- dsd-handoff:v1 -->
+                ## Document Control
+
+                | Field | Value |
+                |---|---|
+                | **Status** | ready |
+                | **Documents** | as-built |
+                | **Source SDD** | `<the measured-against-SDD path for this file>` |
+                | **Source architecture** | `<the architecture json path>` |
+                | **Project** | `<project name>` |
+                | **Product** | `<product>` |
+                | **Build skill** | `<skill>` |
+                | **Generated by** | uipath-documenter |
+                | **Generation date** | <YYYY-MM-DD> |
+
+                ## Table of Contents
+
+            Then the numbered body. Use `## <n>. <Name>` exactly, numbered from 1,
+            contiguous, all present with real content:
+
+                1. Solution Overview
+                2. As-Built Architecture
+                3. Configuration Reference
+                4. Exception and Error Handling
+                5. Operations Runbook
+
+            Five sections, and the document ENDS on Operations Runbook. Troubleshooting
+            Guide, Monitoring and Logging, Deviations from Design, Handover and Support
+            and the rule-traceability table were removed on purpose - together they were
+            roughly half the document and about four minutes of generation on the
+            critical path. Do not reintroduce them under any heading.
+
+            ## Length budget - read this before you write anything
+
+            The whole document is about 6 KB. Not a target to reach: a ceiling to stay
+            under. The previous DSD was 28 KB and took eight minutes to write, which is
+            most of this stage's runtime.
+
+            Length is not a quality signal here. This document is read by a human
+            skimming it on a screen, and nothing downstream parses it - no stage reads
+            the DSD, so a fact stated at length is worth exactly what the same fact is
+            worth in one line. A tight document with a diagram and four clean tables is
+            better documentation AND a better demo than twenty-eight kilobytes nobody
+            scrolls through.
+
+            So: stop when a section has said its thing. Prefer a table row to a
+            paragraph, a path to a description of a path, and one clear sentence to
+            three careful ones. Never restate in section N what section N-1 already
+            said. Do not pad a section to look thorough - the validator's size floor is
+            3 KB across the whole document and you will clear it easily.
+
+            Each section carries its own budget below. They are approximate; the 6 KB
+            total is the one that matters.
+
+            Two things a budget must never do: leave a table with a header and no data
+            rows (the validator fails that), and drop a business exception or system
+            error ID that the SDD lists (the validator checks those are all documented).
+            Trim words, not rows, when those two are at stake.
+
+            What each section must contain:
+
+            1. **Solution Overview** - what this automation does for the business, in
+               plain language a support engineer who has never seen it can follow, plus a
+               table of what was delivered (projects, their roles, their entry points).
+               BUDGET: one paragraph plus that table. Roughly 800 bytes.
+            2. **As-Built Architecture** - the shape of what exists: the projects, how they
+               call each other, what they talk to. A short diagram in a fenced block is
+               welcome. Describe the delivered topology, not the SDD's.
+               No rule-traceability table. The SDD already maps every `BR-xx` to the
+               step that enforces it, and the old table here forced every rule to be
+               written twice - once as `BR-01` and once as the PDD's `BR-001` - to get
+               past a grep. If a rule from the SDD was NOT implemented, say so in
+               section 2 in one line; that is the only rule fact the build knows and
+               the design does not.
+               BUDGET: a fenced diagram plus about ten lines. Roughly 1,200 bytes.
+            3. **Configuration Reference** - the assets, credentials, queues, buckets,
+               connections and config keys the code actually reads, with exact name, type,
+               where it is read and who owns the value. Names come from the code.
+               BUDGET: at most 10 rows, and they are the 10 someone would realistically
+               change or get wrong - connections, credentials, schedules, tunable values.
+               Not every variable the workflow declares. The last one ran to 24 rows.
+               Roughly 1,200 bytes. Make it ONE table - if trimming leaves a sub-table
+               with a header and no data rows the validator fails the document, so merge
+               rather than split.
+            4. **Exception and Error Handling** - ONE table mapping each business
+               exception and system error ID to where it is handled in the code, the
+               retry behaviour, and the resulting state. No prose around it.
+               BUDGET: roughly 1,200 bytes.
+            5. **Operations Runbook** - how this thing is run: trigger and schedule, how to
+               start it manually, expected runtime and volume, what a normal run looks like
+               in the logs, and the prerequisites that must be in place before it will run
+               at all.
+               BUDGET: roughly 1,400 bytes, prerequisites included.
+
+            Anything a human must still do before the first run - an unresolved value, an
+            open TODO in the code, a prerequisite nobody has set up - goes in the
+            Operations Runbook's prerequisites, with its file path. It is the one part of
+            the removed sections that the build knows and nothing else records.
+
+            Sections 2, 3 and 5 must between them cite at least three real paths under
+            `${{ env.CODE_DIR }}/` in backticks - the validator checks every one exists.
+            Component Reference, Data and Interface Reference, Business Rules Implemented,
+            Troubleshooting Guide, Monitoring and Logging, Deviations from Design and
+            Handover and Support were all removed on purpose: they restated the SDD, the
+            code or the org's own runbook rather than recording anything only knowable
+            after the build. Do not reintroduce them.
+
+            ## Hard rules
+
+            - **Never describe something that is not in the code.** If the SDD specifies a
+              retry and the code has none, document that there is none and raise it in
+              section 11. Accuracy about a gap is worth more than a tidy document.
+            - **Reference real paths.** When you name a component, give its actual path
+              under ${{ env.CODE_DIR }}/ in backticks. The validator verifies each one
+              exists.
+            - **No code dumps.** Short expressions and signatures are right; pasting whole
+              workflow files is not. Write NO XAML.
+            - **Never invent** a credential value, endpoint, schedule or owner. Unknown
+              ownership is `[SME REVIEW]`.
+            - Tables are valid GitHub markdown with a header separator row. No HTML. No
+              `<PLACEHOLDER>`, no TBD, no empty table bodies.
+            - Write ONLY the paths listed above. Do NOT modify anything under
+              ${{ env.CODE_DIR }}/ or ${{ env.WORK_DIR }}/. Do NOT run git, gh, or
+              `uip login`.
+
+            ## Step 3 - self-check before you finish
+
+                bash .github/scripts/validate-dsd.sh ${{ env.WORK_DIR }}/architecture.json
+
+            Fix what it reports and re-run until it exits 0. It is a narrow check - the
+            file exists, is not a stub, has a title and sections, has no unclosed code
+            fence and no table with a header but no rows. Clearing it is not a quality
+            bar and passing it is not a reason to keep writing: the section contract and
+            the length budget above are what the document is judged on, and they are
+            yours to honour without being checked.
+
+      - name: Validate DSD
+        id: check
+        continue-on-error: true
+        run: bash .github/scripts/validate-dsd.sh "$WORK_DIR/architecture.json"
+
+      - name: Repair DSD
+        if: steps.check.outcome == 'failure'
+        uses: anthropics/claude-code-base-action@beta
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          model: ${{ env.AGENT_MODEL }}
+          timeout_minutes: '30'
+          allowed_tools: "Read,Write,Edit,Glob,Grep,Bash,Skill"
+          prompt: |
+            The as-built DSD(s) for this build are missing or are not viable markdown.
+
+            Run the check to see what is wrong:
+
+                bash .github/scripts/validate-dsd.sh ${{ env.WORK_DIR }}/architecture.json
+
+            It only ever reports one of five things, and each has a small, local fix:
+
+            - the file does not exist -> write it, following the section contract and the
+              length budget in the generation prompt
+            - it is under the byte minimum -> it is a stub; write the real document
+            - no `# ` H1 title line -> add one
+            - fewer than three `## ` sections -> the document is incomplete; finish it
+            - an unclosed code fence -> close it
+            - a table with a header and no data rows -> give it rows, or delete the table
+
+            This check is deliberately narrow. It does NOT check sections by name, code
+            paths, business rules, document-control fields or table sizes any more, so do
+            NOT go looking for those problems or "improve" the document while you are
+            here. Make the smallest edit that clears what the check reports, re-run it,
+            and stop the moment it exits 0. Every extra minute here is a minute on the
+            pipeline clock for a document nothing downstream reads.
+
+            Do not modify ${{ env.CODE_DIR }}/ or ${{ env.WORK_DIR }}/. Do not run git or gh.
+
+      # Reporting only. The DSD is documentation generated AFTER the build was tested
+      # and the PR reviewed; it must never be the step that fails a good delivery.
+      # NOT `set -e`: a `grep -c` that finds nothing exits 1, and a missing file used
+      # to kill the job with a bare "No such file or directory".
+      - name: Verify DSD
+        env:
+          DSD_NEVER_FAIL: '1'
+          DSD_FILES: ${{ needs.identify.outputs.dsd_files }}
+        run: |
+          set -uo pipefail
+          bash .github/scripts/validate-dsd.sh "$WORK_DIR/architecture.json" || true
+          {
+            echo "### 3. DSD generated"
+            echo ""
+            echo "| File | Bytes | Sections | Code refs |"
+            echo "| --- | --- | --- | --- |"
+            for f in $DSD_FILES; do
+              if [ ! -f "$f" ]; then
+                echo "| \`$f\` | **missing** | - | - |"
+                echo "::warning::$f was not produced. Documentation is advisory, so the run continues."
+                continue
+              fi
+              REFS=$(grep -oE '`'"$CODE_DIR"'/[^`]+`' "$f" | sort -u | wc -l | tr -d ' ')
+              echo "| \`$f\` | $(wc -c < "$f" | tr -d ' ') | $(grep -c '^## [0-9]' "$f" || true) | $REFS |"
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Commit DSD
+        env:
+          DSD_FILES: ${{ needs.identify.outputs.dsd_files }}
+          STORY_KEY: ${{ needs.identify.outputs.story_key }}
+          BRANCH:    ${{ needs.identify.outputs.branch }}
+          REVISION:  ${{ needs.identify.outputs.revision }}
+        run: |
+          set -euo pipefail
+          git config user.name  "uipath-documenter[bot]"
+          git config user.email "uipath-documenter[bot]@users.noreply.github.com"
+          # Add only what exists: a DSD the agent failed to write must not turn the
+          # documentation stage into a failed release.
+          for f in $DSD_FILES; do
+            if [ -f "$f" ]; then
+              git add "$f"
+            else
+              echo "::warning::$f not on disk - nothing to commit for it."
+            fi
+          done
+          if git diff --cached --quiet; then
+            echo "No change to commit - DSD is already up to date."
+          else
+            VERB=$([ "$REVISION" -gt 1 ] && echo "update" || echo "add")
+            git commit -m "docs: $VERB as-built DSD for $STORY_KEY" \
+                       -m "Generated by uipath-documenter from the delivered build."
+            git push origin "HEAD:$BRANCH"
+          fi
+
+  # ═══════════════════════════════════════════════════════════════
+  # 4. Open PR
+  # Still opened, because the case waits on the PR-created event before it waits on
+  # the merge. The next job merges it.
+  # ═══════════════════════════════════════════════════════════════
+  open-pr:
+    name: Open PR
+    needs: [identify, generate-dsd]
+    runs-on: ubuntu-latest
+    outputs:
+      pr_number: ${{ steps.pr.outputs.pr_number }}
+      pr_url:    ${{ steps.pr.outputs.pr_url }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.identify.outputs.branch }}
+          fetch-depth: 1
+
+      - name: Open PR into develop
+        id: pr
+        env:
+          GH_TOKEN:  ${{ secrets.GITHUB_TOKEN }}
+          REPO:      ${{ github.repository }}
+          BRANCH:    ${{ needs.identify.outputs.branch }}
+          STORY_KEY: ${{ needs.identify.outputs.story_key }}
+          ARCH_FILE: ${{ needs.identify.outputs.arch_file }}
+          DSD_FILES: ${{ needs.identify.outputs.dsd_files }}
+          REVISION:  ${{ needs.identify.outputs.revision }}
+        run: |
+          set -euo pipefail
+          BLOB="${{ github.server_url }}/$REPO/blob/$BRANCH"
+          if [ -f "$ARCH_FILE" ]; then
+            PROCESS=$(python3 -c "import json;print(json.load(open('$ARCH_FILE'))['process_name'])")
+          else
+            PROCESS="$STORY_KEY"
+          fi
+          TITLE_LINE="as-built DSD for $PROCESS"
+          [ "$REVISION" -gt 1 ] && TITLE_LINE="as-built DSD update for $PROCESS"
+
+          EXISTING=$(gh pr list --repo "$REPO" --head "$BRANCH" --base "$BASE_BRANCH" \
+                       --state open --json number --jq '.[0].number' || echo "")
+
+          cat > /tmp/pr-body.md <<'EOF_BODY'
+          ## As-built documentation
+
+          The documenter agent read the delivered code and wrote the DSD that describes it:
+          component reference, operations runbook, troubleshooting guide and any deviations
+          from the approved design.
+
+          This PR is merged automatically - the human gate for the release is the
+          `develop` -> `main` PR that follows it.
+          EOF_BODY
+
+          {
+            echo ""
+            echo "| | |"
+            echo "| --- | --- |"
+            echo "| Story | \`$STORY_KEY\` |"
+            echo "| Scope / product | \`${{ needs.identify.outputs.scope }}\` / \`${{ needs.identify.outputs.product }}\` |"
+            echo ""
+            for f in $DSD_FILES; do
+              echo "- DSD: [\`$f\`]($BLOB/$f) — $(wc -c < "$f" | tr -d ' ') bytes"
+            done
+            echo ""
+            echo "<sub>Generated by \`uipath-dsd\` - run [${{ github.run_id }}](${{ github.server_url }}/$REPO/actions/runs/${{ github.run_id }})</sub>"
+          } >> /tmp/pr-body.md
+
+          if [ -n "$EXISTING" ] && [ "$EXISTING" != "null" ]; then
+            gh pr edit "$EXISTING" --repo "$REPO" --title "docs: $TITLE_LINE" --body-file /tmp/pr-body.md
+            PR_NUMBER="$EXISTING"
+          else
+            gh pr create --repo "$REPO" --base "$BASE_BRANCH" --head "$BRANCH" \
+              --title "docs: $TITLE_LINE" --body-file /tmp/pr-body.md
+            PR_NUMBER=$(gh pr list --repo "$REPO" --head "$BRANCH" --base "$BASE_BRANCH" \
+                          --state open --json number --jq '.[0].number')
+          fi
+          if [ -z "$PR_NUMBER" ] || [ "$PR_NUMBER" = "null" ]; then
+            echo "::error::PR from $BRANCH into $BASE_BRANCH was not created. Maestro will not resume."
+            exit 1
+          fi
+          PR_URL=$(gh pr view "$PR_NUMBER" --repo "$REPO" --json url --jq .url)
+          echo "pr_number=$PR_NUMBER" >> "$GITHUB_OUTPUT"
+          echo "pr_url=$PR_URL"       >> "$GITHUB_OUTPUT"
+          {
+            echo "### 4. PR opened"
+            echo ""
+            echo "[#$PR_NUMBER - docs: $TITLE_LINE]($PR_URL) into \`$BASE_BRANCH\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ═══════════════════════════════════════════════════════════════
+  # 5. Merge
+  # No human gate on the DSD: the release gate is the develop -> main PR.
+  # ═══════════════════════════════════════════════════════════════
+  merge:
+    name: Merge
+    needs: [identify, open-pr]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Merge the DSD PR into develop
+        env:
+          GH_TOKEN:  ${{ secrets.GITHUB_TOKEN }}
+          REPO:      ${{ github.repository }}
+          PR_NUMBER: ${{ needs.open-pr.outputs.pr_number }}
+          PR_URL:    ${{ needs.open-pr.outputs.pr_url }}
+        run: |
+          set -euo pipefail
+          # An immediate merge first. --auto only works when the repo has auto-merge
+          # enabled and the branch has required checks, so it is the fallback rather
+          # than the default.
+          if gh pr merge "$PR_NUMBER" --repo "$REPO" --merge; then
+            echo "Merged PR #$PR_NUMBER into $BASE_BRANCH."
+          elif gh pr merge "$PR_NUMBER" --repo "$REPO" --merge --auto; then
+            echo "::notice::Immediate merge was refused; auto-merge is queued on PR #$PR_NUMBER."
+          else
+            echo "::error::Could not merge PR #$PR_NUMBER. Check branch protection and token permissions."
+            exit 1
+          fi
+          {
+            echo "### 5. DSD merged"
+            echo ""
+            echo "[#$PR_NUMBER]($PR_URL) merged into \`$BASE_BRANCH\` automatically."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # This job otherwise makes only `gh` API calls and needs no working tree - but
+      # observe.sh is a FILE, and a job that never checks out has an empty workspace.
+      # Sparse: only the scripts, from develop, so it costs a second.
+      - uses: actions/checkout@v4
+        with:
+          ref: develop
+          sparse-checkout: .github/scripts
+          fetch-depth: 1
+
+      - name: Observe - Documentation done
+        # A dashboard write must never fail the pipeline: observe.sh uses `set -e`, so
+        # a rate limit or a transient 5xx would otherwise take a good stage down with it.
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO:     ${{ github.repository }}
+        run: |
+          bash .github/scripts/observe.sh stage Documentation status=done
+          # dsd_files is a space-separated list (one DSD per project); the first
+          # is the primary document. dsd_plan is a TSV build plan, not a path.
+          DSD_FILE="$(echo "${{ needs.identify.outputs.dsd_files }}" | awk '{print $1}')"
+
+          bash .github/scripts/observe.sh document dsd \
+            path="$DSD_FILE" \
+            url="https://github.com/${{ github.repository }}/blob/develop/$DSD_FILE"
+
+  # ═══════════════════════════════════════════════════════════════
+  # 6. Promote to main
+  # The release gate. This PR is the only one in the chain a human must approve
+  # besides the PDD, and merging it is what triggers uipath-deploy.
+  # ═══════════════════════════════════════════════════════════════
+  promote:
+    name: Promote to main
+    needs: [identify, merge]
+    if: inputs.skip_promote != true
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.BASE_BRANCH }}
+          fetch-depth: 0
+
+      - name: Open the release PR
+        env:
+          GH_TOKEN:  ${{ secrets.GITHUB_TOKEN }}
+          REPO:      ${{ github.repository }}
+          STORY_KEY: ${{ needs.identify.outputs.story_key }}
+          ARCH_FILE: ${{ needs.identify.outputs.arch_file }}
+        run: |
+          set -euo pipefail
+
+          if [ -f "$ARCH_FILE" ]; then
+            PROCESS=$(python3 -c "import json;print(json.load(open('$ARCH_FILE'))['process_name'])")
+          else
+            PROCESS="$STORY_KEY"
+          fi
+
+          # Nothing to promote is a legitimate outcome, not an error - it means the
+          # release branch is already level with develop.
+          AHEAD=$(git rev-list --count "origin/$RELEASE_BRANCH..origin/$BASE_BRANCH" 2>/dev/null || echo "0")
+          if [ "${AHEAD:-0}" -eq 0 ]; then
+            echo "::notice::$BASE_BRANCH is not ahead of $RELEASE_BRANCH - nothing to promote."
+            {
+              echo "### 6. Promotion skipped"
+              echo ""
+              echo "\`$BASE_BRANCH\` has no commits ahead of \`$RELEASE_BRANCH\`."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          EXISTING=$(gh pr list --repo "$REPO" --head "$BASE_BRANCH" --base "$RELEASE_BRANCH" \
+                       --state open --json number --jq '.[0].number' || echo "")
+
+          cat > /tmp/release-body.md <<'EOF_RELEASE'
+          ## Release to production
+
+          Every stage of the lifecycle is complete and merged into `develop`: the PDD you
+          approved, the solution design, the implementation with its agent review, and the
+          as-built documentation.
+
+          **Merging this PR is the production approval.** It triggers `uipath-deploy`,
+          which packs the solution, publishes it and deploys it to Orchestrator.
+
+          **Before you merge**
+          - [ ] The as-built DSD matches what you expect was built
+          - [ ] Every open TODO listed in the DSD's *Operations Runbook* prerequisites
+                is acceptable to ship
+          - [ ] The Orchestrator resources the DSD lists exist in the target folder
+          EOF_RELEASE
+
+          {
+            echo ""
+            echo "| | |"
+            echo "| --- | --- |"
+            echo "| Process | \`$PROCESS\` |"
+            echo "| Story | \`$STORY_KEY\` |"
+            echo "| Commits ahead of \`$RELEASE_BRANCH\` | $AHEAD |"
+            echo ""
+            echo "**Documents in this release**"
+            echo ""
+            for f in $(find "$DOCS_DIR" -maxdepth 1 -type f \( -iname 'pdd-*.md' -o -iname 'sdd-*.md' -o -iname '*-sdd.md' -o -iname '*-dsd.md' \) 2>/dev/null | sort); do
+              echo "- [\`$f\`](${{ github.server_url }}/$REPO/blob/$BASE_BRANCH/$f)"
+            done
+            echo ""
+            echo "<sub>Opened by \`uipath-dsd\` - run [${{ github.run_id }}](${{ github.server_url }}/$REPO/actions/runs/${{ github.run_id }})</sub>"
+          } >> /tmp/release-body.md
+
+          if [ -n "$EXISTING" ] && [ "$EXISTING" != "null" ]; then
+            echo "Release PR #$EXISTING already open - updating it."
+            gh pr edit "$EXISTING" --repo "$REPO" \
+              --title "release: $PROCESS ($STORY_KEY)" --body-file /tmp/release-body.md
+            PR_NUMBER="$EXISTING"
+          else
+            gh pr create --repo "$REPO" --base "$RELEASE_BRANCH" --head "$BASE_BRANCH" \
+              --title "release: $PROCESS ($STORY_KEY)" --body-file /tmp/release-body.md
+            PR_NUMBER=$(gh pr list --repo "$REPO" --head "$BASE_BRANCH" --base "$RELEASE_BRANCH" \
+                          --state open --json number --jq '.[0].number')
+          fi
+
+          if [ -z "$PR_NUMBER" ] || [ "$PR_NUMBER" = "null" ]; then
+            echo "::error::Release PR from $BASE_BRANCH into $RELEASE_BRANCH was not created."
+            exit 1
+          fi
+
+          # This one is never auto-merged: it is the production gate.
+          gh pr edit "$PR_NUMBER" --repo "$REPO" --add-assignee "$ASSIGNEE"
+          if gh pr edit "$PR_NUMBER" --repo "$REPO" --add-reviewer "$ASSIGNEE" 2>/dev/null; then
+            echo "Requested review from $ASSIGNEE."
+          else
+            echo "::notice::Review not requested from $ASSIGNEE (likely the PR author). Assignee is set."
+          fi
+
+          PR_URL=$(gh pr view "$PR_NUMBER" --repo "$REPO" --json url --jq .url)
+          {
+            echo "### 6. Release PR opened"
+            echo ""
+            echo "[#$PR_NUMBER - release: $PROCESS]($PR_URL) into \`$RELEASE_BRANCH\`, assigned to \`$ASSIGNEE\`."
+            echo ""
+            echo "Merging it approves production and triggers \`uipath-deploy\`."
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "Release PR #$PR_NUMBER -> $PR_URL"
+
+      - name: Observe - Production awaiting release approval
+        # A dashboard write must never fail the pipeline: observe.sh uses `set -e`, so
+        # a rate limit or a transient 5xx would otherwise take a good stage down with it.
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO:     ${{ github.repository }}
+        run: |
+          bash .github/scripts/observe.sh stage Production status=in-review decidedBy=human \
+            task="Release PR open for approval"
+
+  # ═══════════════════════════════════════════════════════════════
+  # Fault
+  # Without this a crashed run leaves the stage on `in-progress` and the card
+  # spins for ever. Runs only when a job above actually failed - a skipped job
+  # does not count as a failure.
+  # ═══════════════════════════════════════════════════════════════
+  faulted:
+    name: Record fault
+    needs: [identify, read-build, generate-dsd, open-pr, merge, promote]
+    if: failure()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: develop
+          sparse-checkout: .github/scripts
+          fetch-depth: 1
+
+      - name: Observe - Documentation faulted
+        # A dashboard write must never fail the pipeline: observe.sh uses `set -e`, so
+        # a rate limit or a transient 5xx would otherwise take a good stage down with it.
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO:     ${{ github.repository }}
+        run: |
+          bash .github/scripts/observe.sh stage Documentation status=faulted \
+            task="The documentation run failed" \
+            run=${{ github.run_id }} \
+            runUrl=${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}

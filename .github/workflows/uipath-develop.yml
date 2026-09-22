@@ -1,0 +1,1370 @@
+name: uipath-develop
+
+# Stage 4 of the ADLC chain, as six visible jobs:
+#
+#   Identify design -> Derive tasks -> Build -> Test -> Open PR -> Assign PR
+#
+# Maestro creates branch  dev-<devStoryKey>  from develop (`development-<devStoryKey>`
+# is also accepted - see the trigger). Creating the
+# branch IS the trigger: the SDD and architecture-<key>.json are already on develop
+# (the Architecture PR was merged, which is what released the case into this stage).
+#
+# Same rule as the SDD stage - the design cannot be resolved from this branch's key.
+# Development runs on its own Jira story while the SDD was written on the Architecture
+# story, so the design inputs are found by *shape*, not by key.
+#
+# TESTING IS A JOB HERE, not a separate workflow. The tests need the built project in
+# the same workspace on the same branch, before any PR exists; running them as their
+# own action would mean re-resolving all of that. Build commits the code, Test then
+# validates it and repairs what it can, and the PR only opens once Test is green.
+#
+# Jira is NOT touched from here - Flow owns every Jira transition in this chain.
+#
+# The PR into develop is the Maestro resume signal: the case waits on
+# PULL_CREATED_IN_REPO filtered by head.ref == dev-* && base.ref == develop.
+# This workflow does NOT merge. uipath-review.yml reviews that same PR and merges it
+# into develop if - and only if - the agent approves. Docs (the as-built DSD) runs
+# after that merge, which is why nothing here reads a DSD: at this point none exists.
+
+on:
+  push:
+    branches:
+      # `dev-` is the current convention; `development` is the one the case plan
+      # used. Both are listed so the stage fires either way during the
+      # Case -> Flow migration. Neither pattern matches `develop` itself, so a
+      # merge into develop cannot trigger this workflow.
+      - 'dev-**'
+      - 'development**'
+    # TEMP: while testing, comment the block above and dispatch manually instead.
+    # Note workflow_dispatch only appears in the UI if this file is on the DEFAULT
+    # branch (main), not only on develop.
+  workflow_dispatch:
+    inputs:
+      skip_tests:
+        description: 'Open the PR even if the Test job fails (demo escape hatch)'
+        required: false
+        default: false
+        type: boolean
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  DOCS_DIR: docs
+  CODE_DIR: code
+  BASE_BRANCH: develop
+  ASSIGNEE: irina-capatina-uipath
+  AGENT_MODEL: claude-sonnet-4-6
+  CLI_VERSION: '1.202.0'
+  NODE_VERSION: '20'
+  # Design inputs and the derived task list live here. Must NOT start with a dot:
+  # actions/upload-artifact@v4 silently skips hidden files.
+  WORK_DIR: design-work
+
+permissions:
+  contents: write
+  pull-requests: write
+  id-token: write
+
+concurrency:
+  group: develop-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+
+  # ═══════════════════════════════════════════════════════════════
+  # 1. Identify design inputs
+  # The SDD's Planner Handoff header is a hard gate here: a draft SDD means the
+  # architecture stage did not finish, and building from it produces the wrong thing.
+  # ═══════════════════════════════════════════════════════════════
+  identify:
+    name: Identify design inputs
+    runs-on: ubuntu-latest
+    outputs:
+      branch:     ${{ steps.resolve.outputs.branch }}
+      file_key:   ${{ steps.resolve.outputs.file_key }}
+      story_key:  ${{ steps.resolve.outputs.story_key }}
+      arch_file:  ${{ steps.resolve.outputs.arch_file }}
+      sdd_files:  ${{ steps.resolve.outputs.sdd_files }}
+      root_sdd:   ${{ steps.resolve.outputs.root_sdd }}
+      pdd_files:  ${{ steps.resolve.outputs.pdd_files }}
+      tasks_file: ${{ steps.resolve.outputs.tasks_file }}
+      product:    ${{ steps.resolve.outputs.product }}
+      scope:      ${{ steps.resolve.outputs.scope }}
+      skills:     ${{ steps.resolve.outputs.skills }}
+      project_count: ${{ steps.resolve.outputs.project_count }}
+      solution_name: ${{ steps.resolve.outputs.solution_name }}
+      project_name:  ${{ steps.resolve.outputs.project_name }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+          fetch-depth: 0
+
+      - name: Observe - Development in progress
+        # A dashboard write must never fail the pipeline: observe.sh uses `set -e`, so
+        # a rate limit or a transient 5xx would otherwise take a good stage down with it.
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO:     ${{ github.repository }}
+        run: |
+          bash .github/scripts/observe.sh stage Development status=in-progress \
+            task="Deriving tasks" run=${{ github.run_id }}
+
+      - name: Resolve the design for this branch
+        id: resolve
+        run: |
+          set -euo pipefail
+
+          BRANCH="${GITHUB_REF#refs/heads/}"
+          FILE_KEY="${BRANCH#*-}"
+          if [ -z "$FILE_KEY" ] || [ "$FILE_KEY" = "$BRANCH" ]; then
+            echo "::error::Branch '$BRANCH' has no key after its 'dev-' / 'development-' prefix."
+            exit 1
+          fi
+          STORY_KEY=$(echo "$FILE_KEY" | tr '[:lower:]' '[:upper:]')
+
+          if [ ! -d "$DOCS_DIR" ]; then
+            echo "::error::No $DOCS_DIR folder on branch $BRANCH - nothing to build from."
+            exit 1
+          fi
+
+          # The architecture decision is the build contract, and it lives at a fixed
+          # repository-based name - architecture-<repo>.json - because the lifecycle
+          # updates ONE contract in place rather than writing a new one per story key.
+          # See the naming note in uipath-sdd.yml.
+          REPO_NAME="${GITHUB_REPOSITORY##*/}"
+          ARCH_FILE="$DOCS_DIR/architecture-$REPO_NAME.json"
+
+          # Fallback for a repo not yet migrated: newest key-named file wins, as before.
+          if [ ! -f "$ARCH_FILE" ]; then
+            while IFS= read -r f; do
+              [ -n "$f" ] || continue
+              printf '%s\t%s\n' "$(git log -1 --format=%ct -- "$f" 2>/dev/null || echo 0)" "$f"
+            done < <(find "$DOCS_DIR" -maxdepth 1 -type f -name 'architecture-*.json' | sort) \
+              > /tmp/arch-index.tsv
+            ARCH_FILE=$(sort -t"$(printf '\t')" -k1,1n -k2,2 /tmp/arch-index.tsv | cut -f2- | tail -1)
+            [ -n "${ARCH_FILE:-}" ] && echo "::warning::Using legacy '$ARCH_FILE'; the canonical name is $DOCS_DIR/architecture-$REPO_NAME.json."
+          fi
+
+          if [ -z "${ARCH_FILE:-}" ]; then
+            echo "::error::No $DOCS_DIR/architecture-*.json on branch $BRANCH."
+            echo "::error::The Architecture PR must be merged into $BASE_BRANCH before the Development branch is cut."
+            ls -1 "$DOCS_DIR" 2>/dev/null || true
+            exit 1
+          fi
+          python3 -c "import json,sys;json.load(open(sys.argv[1]))" "$ARCH_FILE" \
+            || { echo "::error::$ARCH_FILE is not valid JSON."; exit 1; }
+
+          PRODUCT=$(python3 -c "import json;print(json.load(open('$ARCH_FILE'))['primary_product'])")
+          SCOPE=$(python3   -c "import json;print(json.load(open('$ARCH_FILE'))['sdd_scope'])")
+          TASKS_FILE=$(python3 -c "import json;print(json.load(open('$ARCH_FILE'))['tasks_file'])")
+          SDD_FILES=$(python3 -c "import json;print(' '.join(f['path'] for f in json.load(open('$ARCH_FILE'))['sdd_files']))")
+          ROOT_SDD=$(python3 -c "
+          import json
+          d=json.load(open('$ARCH_FILE'))
+          r=[f['path'] for f in d['sdd_files'] if f.get('role')=='solution-root']
+          print(r[0] if r else '')")
+          SKILLS=$(python3 -c "
+          import json
+          d=json.load(open('$ARCH_FILE'))
+          seen=[]
+          for p in sorted(d['projects'], key=lambda x: x.get('build_order',99)):
+              s=p.get('skill','')
+              if s and s not in seen: seen.append(s)
+          for c in d.get('integrated_components',[]):
+              s=c.get('skill','')
+              if s and s not in seen: seen.append(s)
+          print(' '.join(seen))")
+          PROJECT_COUNT=$(python3 -c "import json;print(len(json.load(open('$ARCH_FILE'))['projects']))")
+
+          # The solution name and the API Workflow project name are decided once, by
+          # the Architecture stage, and carried in the contract - see
+          # architectural-considerations.md §4 "Naming". Deriving them again here is how
+          # they drift: deploy used to name the deployment after `process_name` while
+          # this stage enforced the repository name, so the packed solution and the
+          # deployment never agreed. Older contracts predate the fields, so fall back.
+          SOLUTION_NAME=$(python3 -c "
+          import json,re
+          d=json.load(open('$ARCH_FILE'))
+          n=d.get('solution_name')
+          if not n:
+              base=d.get('process_kebab') or ''
+              epic=d.get('epic_number') or ''
+              n=(base+'-'+epic) if base and epic else (base or '${GITHUB_REPOSITORY##*/}')
+          print(n)")
+          PROJECT_NAME=$(python3 -c "
+          import json
+          d=json.load(open('$ARCH_FILE'))
+          ps=sorted(d['projects'], key=lambda x: x.get('build_order',99))
+          print(ps[0]['name'] if ps else '')")
+          [ -n "$SOLUTION_NAME" ] || { echo "::error::$ARCH_FILE yields no solution name."; exit 1; }
+          [ -n "$PROJECT_NAME" ]  || { echo "::error::$ARCH_FILE declares no project."; exit 1; }
+          echo "Solution: $SOLUTION_NAME   first project: $PROJECT_NAME"
+
+          # ── the Planner Handoff gate ───────────────────────────────────────────
+          # A draft SDD, or one the planner cannot even detect, must not reach a build.
+          MISSING=""
+          for f in $SDD_FILES; do
+            if [ ! -f "$f" ]; then MISSING="$MISSING $f"; continue; fi
+            grep -qF '<!-- planner-handoff:v1 -->' "$f" \
+              || { echo "::error::$f has no planner-handoff marker - not a planner SDD."; exit 1; }
+            if grep -qiE '\*\*Status\*\*[^|]*\|[[:space:]]*draft' "$f"; then
+              echo "::error::$f is still 'Status: draft' - the Architecture stage did not finish."
+              exit 1
+            fi
+            grep -qiE '\*\*Status\*\*[^|]*\|[[:space:]]*ready' "$f" \
+              || { echo "::error::$f has no 'Status | ready' row - refusing to build from it."; exit 1; }
+          done
+          if [ -n "$MISSING" ]; then
+            echo "::error::$ARCH_FILE declares SDD file(s) that are not on this branch:$MISSING"
+            exit 1
+          fi
+
+          PDD_FILES=$(find "$DOCS_DIR" -maxdepth 1 -type f \
+                        \( -iname 'pdd-*.md' -o -iname '*-pdd.md' \) \
+                      | sort | tr '\n' ' ' | sed 's/ *$//')
+
+
+          {
+            echo "branch=$BRANCH"
+            echo "file_key=$FILE_KEY"
+            echo "story_key=$STORY_KEY"
+            echo "arch_file=$ARCH_FILE"
+            echo "sdd_files=$SDD_FILES"
+            echo "root_sdd=$ROOT_SDD"
+            echo "pdd_files=$PDD_FILES"
+            echo "tasks_file=$TASKS_FILE"
+            echo "product=$PRODUCT"
+            echo "scope=$SCOPE"
+            echo "skills=$SKILLS"
+            echo "project_count=$PROJECT_COUNT"
+            echo "solution_name=$SOLUTION_NAME"
+            echo "project_name=$PROJECT_NAME"
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### 1. Design inputs identified"
+            echo ""
+            echo "| Field | Value |"
+            echo "| --- | --- |"
+            echo "| Branch | \`$BRANCH\` |"
+            echo "| Story key | \`$STORY_KEY\` |"
+            echo "| Architecture | \`$ARCH_FILE\` |"
+            echo "| Scope | \`$SCOPE\` |"
+            echo "| Primary product | \`$PRODUCT\` |"
+            echo "| Projects to build | $PROJECT_COUNT |"
+            echo "| Build skills | \`$SKILLS\` |"
+            echo "| SDD(s) | $(for f in $SDD_FILES; do printf '`%s` ' "$f"; done) |"
+            echo "| Tasks file | \`$TASKS_FILE\` |"
+            echo ""
+            echo "Planner Handoff gate: every SDD carries the v1 marker and \`Status: ready\`."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "Architecture: $ARCH_FILE ($SCOPE / $PRODUCT, $PROJECT_COUNT project(s))"
+          echo "Skills:       $SKILLS"
+
+  # ═══════════════════════════════════════════════════════════════
+  # 2. Derive tasks
+  # The planner's Lane A: SDD -> the ordered, per-skill task list. Kept as its own
+  # job so the build has a written plan to work against rather than improvising,
+  # and so a reviewer can see what the agent thought it was going to do.
+  # ═══════════════════════════════════════════════════════════════
+  derive-tasks:
+    name: Derive tasks
+    needs: identify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.identify.outputs.branch }}
+          fetch-depth: 1
+
+      - name: Install UiPath skills
+        id: skills
+        continue-on-error: true
+        run: |
+          set -uo pipefail
+          npm i -g "@uipath/cli@${CLI_VERSION}" || { echo "::warning::@uipath/cli install failed"; exit 1; }
+          # --path must already exist; the CLI refuses to create it and fails with
+          # "Path does not exist or is not a directory".
+          mkdir -p "$RUNNER_TEMP/uip-skills"
+          uip skills install --agent codex --path "$RUNNER_TEMP/uip-skills" \
+            || { echo "::warning::uip skills install failed"; exit 1; }
+          mkdir -p "$HOME/.claude/skills"
+          cp -R "$RUNNER_TEMP/uip-skills/.agents/skills/." "$HOME/.claude/skills/"
+          ls -1 "$HOME/.claude/skills"
+
+      - name: Run uipath-planner agent
+        uses: anthropics/claude-code-base-action@beta
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          model: ${{ env.AGENT_MODEL }}
+          timeout_minutes: '20'
+          allowed_tools: "Read,Write,Edit,Glob,Grep,Bash,Skill"
+          prompt: |
+            You derive the implementation task list from an approved SDD. You do NOT
+            write any automation code in this step.
+
+            Architecture: ${{ needs.identify.outputs.arch_file }}
+            SDD(s):       ${{ needs.identify.outputs.sdd_files }}
+            Root SDD:     ${{ needs.identify.outputs.root_sdd }}  (empty for single-product)
+            OUTPUT:       ${{ env.WORK_DIR }}/${{ needs.identify.outputs.tasks_file }}
+
+            ## Step 0 - load the planner skill if it is installed
+
+            Run `ls ~/.claude/skills`. If `uipath-planner` is there, READ
+            `~/.claude/skills/uipath-planner/SKILL.md` with the Read tool and follow
+            **Lane A** in AUTONOMOUS mode - the SDD already carries `Status: ready` and
+            `Execution autonomy: autonomous`, so never ask a question and never re-ask
+            anything the handoff header already answers. Emit NO live TaskCreate calls:
+            write the task list to the OUTPUT file instead.
+
+            NEVER load a skill through the Task tool. Spawning a subagent fails in this
+            runner: it resolves a retired model id and comes back
+            `404 not_found_error - model: claude-sonnet-4-20250514`, so you lose the skill
+            entirely. Read SKILL.md with the Read tool, and read the reference files it
+            points at the same way.
+
+            If the skill is not installed, follow Step 2 below.
+
+            ## Step 1 - read the design
+
+            Read the architecture json and every SDD it declares. For solution scope, read
+            the root's Project Inventory first, then each child. The architecture json's
+            `projects[]` is the authoritative build list with `build_order` and `skill`
+            already decided - do not re-derive it or re-order it.
+
+            ## Step 2 - write the task list
+
+            Write a markdown file to the OUTPUT path with:
+
+            - A header table: process name, architecture file, SDD file(s), scope, primary
+              product, generation date (`date +%F`), and `Derived by: uipath-develop`.
+            - One `## Task <n> - <title>` section per task, in build order. Each carries a
+              table with: Skill (from `projects[].skill` / `integrated_components[].skill`),
+              Project, Depends on (task numbers), SDD section reference, and Deliverable.
+              Then 2-5 bullets of intent.
+            - Integrated components come BEFORE the project that consumes them.
+            - A mandatory Testing task per build skill, as the last tasks, routed to that
+              specialist's own testing references.
+            - A final `## Definition of Done` section listing what must be true for the PR
+              to be reviewable.
+
+            ## Hard rules
+
+            - Reference SDD sections by number; do NOT copy architecture content into the
+              task list. The build job reads the SDD itself.
+            - Do NOT describe specialist-internal procedure (target configuration, OR
+              registration, pack/publish, HITL field schemas, auth). Say WHICH skill and
+              IN WHAT ORDER; the specialist owns its own how.
+            - Do NOT invent selectors, URLs, credentials or resource values.
+            - Write exactly one file. Do NOT touch anything under ${{ env.CODE_DIR }}.
+            - Do NOT run git, gh, or `uip login`.
+
+      - name: Verify task list
+        run: |
+          set -euo pipefail
+          T="$WORK_DIR/${{ needs.identify.outputs.tasks_file }}"
+          [ -f "$T" ] || { echo "::error::$T was not written."; exit 1; }
+          N=$(grep -c '^## Task ' "$T" || true)
+          if [ "${N:-0}" -lt 2 ]; then
+            echo "::error::Only ${N:-0} task section(s) in $T - that is not a usable plan."
+            exit 1
+          fi
+          grep -q '^## Definition of Done' "$T" \
+            || { echo "::error::$T has no 'Definition of Done' section."; exit 1; }
+          {
+            echo "### 2. Tasks derived"
+            echo ""
+            echo "\`$T\` - ${N} tasks."
+            echo ""
+            grep -E '^## (Task |Definition)' "$T" | sed 's/^## /- /'
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "--- task list ---"; cat "$T"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: design
+          path: ${{ env.WORK_DIR }}
+          retention-days: 1
+          if-no-files-found: error
+
+  # ═══════════════════════════════════════════════════════════════
+  # 3. Build
+  # The heaviest agent step in the chain. It writes real project code under code/,
+  # then commits - Test runs against what was committed, not against a workspace
+  # only this job could see.
+  # ═══════════════════════════════════════════════════════════════
+  build:
+    name: Build
+    needs: [identify, derive-tasks]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.identify.outputs.branch }}
+          fetch-depth: 1
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: design
+          path: ${{ env.WORK_DIR }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Install UiPath CLI and skills
+        id: skills
+        continue-on-error: true
+        run: |
+          set -uo pipefail
+          npm i -g "@uipath/cli@${CLI_VERSION}" || { echo "::warning::@uipath/cli install failed"; exit 1; }
+          uip --version
+          # --path must already exist; the CLI refuses to create it and fails with
+          # "Path does not exist or is not a directory".
+          mkdir -p "$RUNNER_TEMP/uip-skills"
+          uip skills install --agent codex --path "$RUNNER_TEMP/uip-skills" \
+            || { echo "::warning::uip skills install failed"; exit 1; }
+          mkdir -p "$HOME/.claude/skills"
+          cp -R "$RUNNER_TEMP/uip-skills/.agents/skills/." "$HOME/.claude/skills/"
+          ls -1 "$HOME/.claude/skills"
+
+      - name: Run uipath-developer agent
+        uses: anthropics/claude-code-base-action@beta
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          model: ${{ env.AGENT_MODEL }}
+          timeout_minutes: '55'
+          allowed_tools: "Read,Write,Edit,Glob,Grep,Bash,Skill"
+          prompt: |
+            You are uipath-developer. The design is approved and the task list is written.
+            Build it.
+
+            Architecture:  ${{ needs.identify.outputs.arch_file }}
+            SDD(s):        ${{ needs.identify.outputs.sdd_files }}
+            Task list:     ${{ env.WORK_DIR }}/${{ needs.identify.outputs.tasks_file }}
+            Org rules:     ${{ env.DOCS_DIR }}/architectural-considerations.md
+            Build skills:  ${{ needs.identify.outputs.skills }}
+            Primary:       ${{ needs.identify.outputs.product }}
+            Scope:         ${{ needs.identify.outputs.scope }}
+                           (`single-product` = ONE API Workflow project inside a
+                            UiPath Solution; you still build the solution - Step 1.5)
+            Projects:      ${{ needs.identify.outputs.project_count }}
+            Write code to: ${{ env.CODE_DIR }}/<project-kebab>/
+
+            ## Step 0 - load the specialist skill for each project
+
+            Run `ls ~/.claude/skills`. For EVERY skill named in Build skills above, READ
+            `~/.claude/skills/<skill-name>/SKILL.md` with the Read tool before touching
+            that project's files, and follow it. Those skills own the real authoring
+            procedure - scaffolding commands, file formats, activity shapes, project
+            metadata. Do not improvise a project layout from memory when the skill is
+            available.
+
+            NEVER load a skill through the Task tool. Spawning a subagent fails in this
+            runner: it resolves a retired model id and comes back
+            `404 not_found_error - model: claude-sonnet-4-20250514`, so you lose the skill
+            entirely. Read SKILL.md with the Read tool, and read the reference files it
+            points at the same way.
+
+
+            If the skills are NOT installed, still build the project using the `uip` CLI's
+            own scaffolding (`uip <group> --help` to discover the supported verbs - never
+            invent one) and keep the structure the SDD's Project Structure section
+            prescribes.
+
+            ## Step 1 - read the design, then work the task list in order
+
+            Read the architecture json, every SDD, and the task list. Work the tasks in
+            build order. The SDD is the specification: its schemas, named resources,
+            business rules and process steps are what you implement. Where the SDD and
+            your instinct disagree, the SDD wins - it was reviewed and approved.
+
+            Read `Org rules` above in full as well - it is the org's own platform facts,
+            and it is AUTHORITATIVE. The SDD deliberately does NOT repeat what is in it.
+
+            **§4 "Connection and credential patterns" is binding, and you must read it
+            BEFORE you write a single connector activity.** It carries, verbatim and
+            marked fixed byte for byte: the approved HTTP Request activity shape with
+            `authentication: "connector"`, the matching `bindings_v2.json` entry, and
+            the solution connection-resource file. Copy those shapes from there and fill
+            in the connector key, connection id and endpoint the SDD names for that
+            step. `validate-build.sh` checks your output against §4, so §4 is what you
+            build to. The SDD tells you WHICH connection each step uses; §4 tells you
+            HOW to write the activity. A previous build guessed the shape instead of
+            reading §4, wrote `connectionId: "ImplicitConnection"` on every HTTP
+            activity, and the whole workflow failed at runtime on
+            `baseUrl is required and cannot be empty`.
+
+            **The Slack message is Block Kit, and the whole payload goes in
+            `bodyParameters.body`.** §4's HTTP Request example shows a shortened
+            one-line `body` so the ACTIVITY shape stays readable - that shortened line
+            is not the payload. The payload is the full JSON object under §4's *"The
+            Slack message is Block Kit, and it goes in `body`"*, with `channel`, `text`
+            and `blocks` together as one value, and the `${...}` placeholders in it
+            replaced by your workflow's actual values. Read that subsection to the end,
+            including its table of non-obvious rules, before you write the Slack
+            activity:
+
+            - `channel` is the member id from §4's table, never an email address
+            - top-level `text` must be present - with `blocks` it is the push
+              notification, and omitting it renders "This content can't be displayed"
+            - the three body lines are ONE `section` separated by `\n`, not three
+              sections; Slack puts a margin between blocks, not between lines
+            - the button `url` must resolve to a real absolute URL at send time - Block
+              Kit rejects an unsubstituted placeholder outright
+            - `header` is `plain_text` only; emoji via `:name:` with `"emoji": true`
+
+            A real run has already shipped the shortened form and produced an
+            unformatted wall of prose in Slack. `validate-build.sh` now fails the build
+            when a Slack `chat.postMessage` body carries no `blocks`.
+
+            §8 is binding on simplicity, and the rest of the file answers delivery
+            model, region, folder, logging target and system base URLs - a plain value
+            there is a confirmed fact, so state it rather than inventing one.
+
+            The implementation-level calls are yours to make - argument names, file
+            layout, where a try/catch sits. Record each non-obvious one in the build
+            notes, because the Docs stage writes the as-built DSD from them afterwards.
+
+            For each task:
+            1. Load its skill (Step 0) if you have not already.
+            2. Scaffold or open the project under ${{ env.CODE_DIR }}/. A scaffolding
+               command writes starter files of its own - `uip api-workflow init` emits
+               Workflow.json, bindings_v2.json, entry-points.json and project.uiproj.
+               You may write over a scaffolded file ONCE, to lay down your first version
+               (see Hard rules). After that the file is yours: patch it, never
+               regenerate it.
+            3. Implement what the SDD section referenced by that task specifies.
+            4. Run whatever validate/build command that skill prescribes, and fix what it
+               reports before moving on. Do not leave a project that does not validate.
+
+            ## Hard rules
+
+            - **Write the big file ONCE. After that, patch it.** Regenerating a large
+              file to fix it is the single most expensive mistake you can make here. A
+              previous run spent 130s writing Workflow.json, validated, found one wrong
+              field shape, deleted the file, and spent another 131s writing it again -
+              4.4 minutes to fix something `Edit` would have fixed in seconds.
+              So:
+                - First version of a scaffolded file: `rm <file>` then Write, or Read
+                  then Write. (Write is REJECTED on a file that exists but has not been
+                  Read this session, and the rejection lands only AFTER you have
+                  generated the entire payload - that is what `rm` avoids.)
+                - Every version after that: `Edit` / `MultiEdit`, or a small `python3`
+                  patch script. The validator tells you exactly which fields are wrong;
+                  change those fields.
+                - NEVER `rm` a file you authored yourself this session in order to
+                  rewrite it. If you are about to delete your own work and regenerate
+                  it, stop - the fix is an Edit.
+                - A full rewrite is justified ONLY when the file's top-level structure
+                  is wrong (wrong root keys, wrong activity nesting throughout). "Many
+                  activities have the same wrong field" is a MultiEdit or a scripted
+                  patch, not a rewrite. Say in the build notes why you rewrote.
+            - **Build the simplest thing that satisfies the SDD.** Straight-line happy
+              path first. Do not add retry loops, per-call try/catch, correlation keys,
+              extra terminal outcomes or state variables unless the SDD explicitly
+              specifies them - and prefer a platform-native mechanism (e.g. an API
+              Workflow's `httpRetryConfig`) over building one out of activities. See
+              `architectural-considerations.md` §8. This never licenses dropping a
+              business rule: same coverage, fewer moving parts.
+            - **Implement every business rule** the SDD lists. A `BR-xx` with no
+              implementation is an incomplete build, not a detail.
+            - **Named resources come from the SDD** - queue names, asset names, argument
+              names, config keys. Do not rename them; downstream deployment expects them.
+            - **Never invent a credential value, selector, URL or endpoint.** A selector
+              needs the live application: leave a clearly-marked TODO comment naming the
+              element and the SDD section, and record it in the build notes.
+            - **No Orchestrator calls.** Do NOT run `uip login` or anything that needs a
+              tenant - this runner has no credentials. Build and validate locally only.
+            - Do NOT modify anything in ${{ env.DOCS_DIR }}/ or ${{ env.WORK_DIR }}/.
+            - Do NOT run git or gh. The workflow commits for you.
+
+            ## Step 1.5 - wrap the projects in a solution, ALWAYS
+
+            The target shape for this programme is fixed: a UiPath SOLUTION containing
+            exactly ONE API Workflow project. Every build ships as a solution, whatever
+            the scope says. "Single-product, single-project" describes how many projects
+            the solution CONTAINS - one - not whether there is a solution. Without a `.uipx` the Test stage's `uip solution pack`
+            gate finds nothing to pack and passes silently, so the build reaches review
+            with its deploy readiness never once proven, and deployment falls back to
+            per-project packages - a different and far less exercised path.
+
+            Read `~/.claude/skills/uipath-solution/SKILL.md` first and follow it. Then,
+            from `${{ env.CODE_DIR }}/`:
+
+            1. Probe the surface: `uip solution init --help --output json`. `Success`
+               means the verb is `init`; `unknown command` means this CLI still calls it
+               `new`. Never invent a verb.
+            2. Create the solution with its name EXACTLY
+               `${{ needs.identify.outputs.solution_name }}`. That string is decided by
+               the Architecture stage and carried in the contract; it is
+               `<process-base>-<epic-number>`, NOT the repository name and NOT the
+               process name. Deployment publishes the package under it AND names the
+               Orchestrator sub-folder after it, so a different one here orphans the
+               package and collides with the previous epic's folder. The step after you
+               fails the build if the packed `.uipx` is named anything else.
+            3. Register the project with `uip solution projects add`. There is exactly
+               ONE API Workflow project and its name is
+               `${{ needs.identify.outputs.project_name }}` - the contract's
+               `projects[0].name`. That one string has to appear in THREE places or the
+               build is rejected:
+                 * the project DIRECTORY name
+                 * `project.uiproj`'s `"Name"` field - this is the one Orchestrator
+                   displays, and getting it wrong is how a solution ended up reading
+                   one name in git and a different one in the tenant
+                 * consequently `resources/solution_folder/process/api/<name>.json`
+               If you rename a project after registering it, use
+               `uip solution projects remove <old>` then `add` - deleting the directory
+               by hand leaves a stale process resource that deploys as a phantom second
+               process, and the step after you fails the build for it.
+               Coded-app directories are the one exception - they are never in a `.uipx`.
+            4. Do NOT run `uip solution resources refresh` and do NOT run `uip login`.
+               Refresh reads live cloud state and this runner has no credentials; the
+               deploy stage does it where they exist.
+            5. Prove it before you write the build notes:
+               `uip solution pack . /tmp/buildcheck --name ${{ needs.identify.outputs.solution_name }} --version 0.0.1 --output json`
+               must succeed. If it fails, fix the solution here - do not hand a broken
+               one to the Test stage.
+
+            `.uipx` and `resources/solution_folder/` are generated. Never hand-edit
+            either; they desync and fail silently. Use `projects add` / `remove`.
+
+            ## Step 2 - write build notes
+
+            Write `${{ env.CODE_DIR }}/build-notes.md`:
+
+            - One-line summary of what was built.
+            - A table: Task | Project | Status (done / partial / blocked) | Notes.
+            - `## Deviations from the SDD` - anything you did differently, and why. Empty
+              is a valid answer; say so explicitly.
+            - `## Left for a human` - every TODO you left, with file, line and the SDD
+              section it relates to. Selectors and credential values belong here.
+            - `## How to test this` - the exact commands a reviewer should run.
+
+            Write the file even if the build went perfectly. The review stage reads it.
+
+      - name: Verify build output
+        id: verify
+        run: |
+          set -euo pipefail
+          if [ ! -d "$CODE_DIR" ]; then
+            echo "::error::$CODE_DIR/ does not exist - the agent produced no project."
+            exit 1
+          fi
+          [ -f "$CODE_DIR/build-notes.md" ] \
+            || { echo "::error::$CODE_DIR/build-notes.md was not written."; exit 1; }
+
+          # Something that looks like a UiPath project must exist.
+          FOUND=$(find "$CODE_DIR" -maxdepth 3 -type f \
+                    \( -name 'project.json' -o -name 'project.uiproj' -o -name 'Workflow.json' \
+                    -o -name '*.xaml' -o -name 'agent.json' -o -name 'uipath.json' \
+                    -o -name 'package.json' -o -name '*.flow' -o -name 'caseplan.json' \) \
+                  | head -20)
+          if [ -z "$FOUND" ]; then
+            echo "::error::No recognisable UiPath project file under $CODE_DIR/."
+            find "$CODE_DIR" -type f | head -40
+            exit 1
+          fi
+          echo "Project files found:"; echo "$FOUND"
+
+          # A solution is mandatory. Deployment can fall back to per-project packages,
+          # but that path is barely exercised, and with no .uipx the Test stage's
+          # `uip solution pack` gate has nothing to iterate over and passes silently -
+          # a build reaching review with deploy readiness unproven. Fail here instead.
+          WANT_SOLUTION="${{ needs.identify.outputs.solution_name }}"
+          SOLUTION_DIR=$(find "$CODE_DIR" -maxdepth 3 -type f -name '*.uipx' \
+                           -not -path "*/dist/*" -not -path "*/obj/*" \
+                           -exec dirname {} \; | sort -u | head -1)
+          if [ -z "$SOLUTION_DIR" ]; then
+            echo "::error::No .uipx under $CODE_DIR/ - every build ships as a solution."
+            echo "::error::Create it with 'uip solution init $WANT_SOLUTION' and register each project with 'uip solution projects add'."
+            find "$CODE_DIR" -type f | head -40
+            exit 1
+          fi
+          # The solution name is the contract's `solution_name` - <process-base>-<epic
+          # number>. Deploy publishes the package under it and names the Orchestrator
+          # sub-folder after it, so the two must be the same string or the deployment
+          # lands beside its package instead of on it.
+          GOT_SOLUTION=$(basename "$(find "$SOLUTION_DIR" -maxdepth 1 -name '*.uipx' | head -1)" .uipx)
+          if [ "$GOT_SOLUTION" != "$WANT_SOLUTION" ]; then
+            echo "::error::Solution is named '$GOT_SOLUTION' but must be '$WANT_SOLUTION' (architecture.json solution_name) - deploy publishes and creates its Orchestrator folder under that name."
+            exit 1
+          fi
+          echo "Solution: $SOLUTION_DIR ($GOT_SOLUTION.uipx)"
+
+          # ── the API Workflow project: one of them, named the contract's name ────
+          # Orchestrator shows the project under `project.uiproj`'s "Name", NOT under
+          # the directory name and NOT under the solution name. A build that got this
+          # wrong shipped a solution that read `jactiv-707-no-po-invoice-chaser` in git
+          # and `NoPoInvoiceChaser` in Orchestrator - the two swapped relative to each
+          # other, which is impossible to talk through on stage. Gate all three so the
+          # repository and the tenant always read the same.
+          WANT_PROJECT="${{ needs.identify.outputs.project_name }}"
+          PROJ_DIRS=$(find "$SOLUTION_DIR" -mindepth 2 -maxdepth 2 -name 'project.uiproj' \
+                        -not -path "*/dist/*" -not -path "*/obj/*" \
+                        -exec dirname {} \; | sort)
+          PROJ_COUNT=$(printf '%s\n' "$PROJ_DIRS" | grep -c . || true)
+
+          if [ "${{ needs.identify.outputs.scope }}" = "single-product" ] && [ "$PROJ_COUNT" -ne 1 ]; then
+            echo "::error::The solution holds $PROJ_COUNT API Workflow project(s); single-product scope means exactly ONE."
+            echo "::error::Fold the extra work into the one project - a second HTTP call is another activity, not another project."
+            printf '%s\n' "$PROJ_DIRS" | sed 's/^/  - /'
+            exit 1
+          fi
+
+          if [ -n "$WANT_PROJECT" ] && [ "$PROJ_COUNT" -eq 1 ]; then
+            PROJ_DIR=$(printf '%s\n' "$PROJ_DIRS" | head -1)
+            GOT_DIR=$(basename "$PROJ_DIR")
+            GOT_NAME=$(python3 -c "import json;print(json.load(open('$PROJ_DIR/project.uiproj')).get('Name') or '')")
+            if [ "$GOT_DIR" != "$WANT_PROJECT" ]; then
+              echo "::error::The project directory is '$GOT_DIR' but must be '$WANT_PROJECT' (architecture.json projects[0].name)."
+              exit 1
+            fi
+            if [ "$GOT_NAME" != "$WANT_PROJECT" ]; then
+              echo "::error::$PROJ_DIR/project.uiproj has \"Name\": '$GOT_NAME' but must be '$WANT_PROJECT' - that field is what Orchestrator displays, so git and the tenant would disagree."
+              exit 1
+            fi
+            # The solution's process resource is written from the project name, so a
+            # stale one left behind by a rename ships a second, phantom process.
+            STALE=$(find "$SOLUTION_DIR/resources/solution_folder/process" -name '*.json' 2>/dev/null \
+                      -not -name "$WANT_PROJECT.json" | sort)
+            if [ -n "$STALE" ]; then
+              echo "::error::Stale process resource(s) under resources/solution_folder/process - a rename left them behind and they deploy as extra processes:"
+              printf '%s\n' "$STALE" | sed 's/^/  - /'
+              echo "::error::Remove them with 'uip solution projects remove <old-name>' rather than deleting the files by hand."
+              exit 1
+            fi
+            echo "Project: $PROJ_DIR (uiproj Name '$GOT_NAME')"
+          fi
+
+          BLOCKED=$(grep -ci 'blocked' "$CODE_DIR/build-notes.md" || true)
+          {
+            echo "### 3. Build"
+            echo ""
+            echo "Project files:"
+            echo ""
+            echo "$FOUND" | sed 's/^/- `/; s/$/`/'
+            echo ""
+            echo "<details><summary>build-notes.md</summary>"
+            echo ""
+            cat "$CODE_DIR/build-notes.md"
+            echo ""
+            echo "</details>"
+          } >> "$GITHUB_STEP_SUMMARY"
+          # NOT `[ cond ] && echo ...`: this is the last command in the step, it runs under
+          # `bash -e`, and a false test makes the whole step exit 1 - failing a build that
+          # actually succeeded, purely because nothing was blocked.
+          if [ "${BLOCKED:-0}" -gt 0 ]; then
+            echo "::warning::build-notes.md mentions blocked work - check the summary."
+          fi
+
+      - name: Commit build
+        run: |
+          set -euo pipefail
+          git config user.name  "uipath-developer[bot]"
+          git config user.email "uipath-developer[bot]@users.noreply.github.com"
+          git add "$CODE_DIR"
+          if git diff --cached --quiet; then
+            echo "No change to commit - the build produced nothing new."
+          else
+            git commit -m "feat: implement ${{ needs.identify.outputs.story_key }}" \
+                       -m "Built by uipath-developer from ${{ needs.identify.outputs.arch_file }}."
+            git push origin "HEAD:${{ needs.identify.outputs.branch }}"
+          fi
+
+  # ═══════════════════════════════════════════════════════════════
+  # 4. Test
+  # The Testing stage, folded in here rather than run as its own action. Product-aware:
+  # the validate/build verb comes from the architecture's primary_product. One repair
+  # pass, then a hard gate - so the PR that reaches review always builds.
+  # ═══════════════════════════════════════════════════════════════
+  test:
+    name: Test
+    needs: [identify, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.identify.outputs.branch }}
+          fetch-depth: 1
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: design
+          path: ${{ env.WORK_DIR }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Install UiPath CLI and skills
+        continue-on-error: true
+        run: |
+          set -uo pipefail
+          npm i -g "@uipath/cli@${CLI_VERSION}" || { echo "::warning::@uipath/cli install failed"; exit 1; }
+          uip --version
+          # --path must already exist; the CLI refuses to create it and fails with
+          # "Path does not exist or is not a directory".
+          mkdir -p "$RUNNER_TEMP/uip-skills"
+          uip skills install --agent codex --path "$RUNNER_TEMP/uip-skills" \
+            || { echo "::warning::uip skills install failed"; exit 1; }
+          mkdir -p "$HOME/.claude/skills"
+          cp -R "$RUNNER_TEMP/uip-skills/.agents/skills/." "$HOME/.claude/skills/"
+
+      # Deterministic first pass. The verbs differ per product and the CLI surface
+      # drifts between versions, so an unknown-command result is reported for the
+      # agent to resolve rather than treated as a build failure.
+      - name: Observe - Testing in progress
+        # A dashboard write must never fail the pipeline: observe.sh uses `set -e`, so
+        # a rate limit or a transient 5xx would otherwise take a good stage down with it.
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO:     ${{ github.repository }}
+        run: |
+          bash .github/scripts/observe.sh stage Testing status=in-progress task="Running tests"
+
+      - name: Validate project
+        id: validate
+        continue-on-error: true
+        run: |
+          set -uo pipefail
+          PRODUCT="${{ needs.identify.outputs.product }}"
+          echo "Primary product: $PRODUCT"
+          mkdir -p "$WORK_DIR"
+          LOG="$WORK_DIR/test-log.txt"
+          : > "$LOG"
+          RC=0
+
+          run_in_projects() {
+            local marker="$1"; shift
+            local found=0
+            while IFS= read -r d; do
+              [ -n "$d" ] || continue
+              found=1
+              echo "=== $* (in $d) ===" | tee -a "$LOG"
+              ( cd "$d" && "$@" ) 2>&1 | tee -a "$LOG" || RC=1
+            done < <(find "$CODE_DIR" -maxdepth 3 -type f -name "$marker" -exec dirname {} \; | sort -u)
+            [ "$found" -eq 1 ] || { echo "::warning::no $marker under $CODE_DIR - nothing validated for it"; }
+          }
+
+          case "$PRODUCT" in
+            # An API Workflow project is marked by project.uiproj - it has no
+            # uipath.json, so keying on that validated nothing and passed silently.
+            #
+            # `validate` and `run` take the workflow FILE (MainFile from
+            # project.uiproj, normally Workflow.json); `build` takes the project
+            # DIRECTORY. Handing run_in_projects a bare file-based verb exits 3
+            # with "missing required argument 'file'".
+            api-workflows)
+              # NO `uip api-workflow run` here. `--no-auth` means no Integration
+              # Service credentials and no connection context, so any HTTP Request
+              # with `authentication: "connector"` dies on `baseUrl is required and
+              # cannot be empty` however correct the workflow is. It is an
+              # unsatisfiable gate for every design that calls a connector, and it
+              # cost a repair round-trip that fixed the real defect and still failed.
+              # build + validate + validate-build.sh + `uip solution pack` is the
+              # offline gate; a live run belongs to deploy, where credentials exist.
+              run_in_projects 'project.uiproj' bash -c '
+                MAIN=$(python3 -c "import json;print(json.load(open(\"project.uiproj\")).get(\"MainFile\") or \"Workflow.json\")")
+                echo "MainFile: $MAIN"
+                uip api-workflow build . &&
+                uip api-workflow validate "$MAIN"
+              '
+              ;;
+            rpa-process|rpa-library|rpa-test-automation)
+              run_in_projects 'project.json' uip rpa restore
+              run_in_projects 'project.json' uip rpa build
+              ;;
+            maestro-flow)    run_in_projects 'project.json' uip maestro flow validate ;;
+            maestro-bpmn)    run_in_projects 'project.json' uip maestro bpmn validate ;;
+            case-management) run_in_projects 'project.uiproj' uip maestro case validate ;;
+            agents)          run_in_projects 'agent.json' uip agent pack --output-dir /tmp/agentpack ;;
+            coded-apps)
+              run_in_projects 'package.json' npm ci
+              run_in_projects 'package.json' npm run build
+              ;;
+            *)
+              echo "::warning::No validation recipe for product '$PRODUCT' - the agent will resolve it." | tee -a "$LOG"
+              RC=1
+              ;;
+          esac
+
+          # Any JSON in the project must at least parse.
+          while IFS= read -r j; do
+            python3 -c "import json,sys;json.load(open(sys.argv[1]))" "$j" \
+              || { echo "::error::$j is not valid JSON" | tee -a "$LOG"; RC=1; }
+          done < <(find "$CODE_DIR" -maxdepth 4 -type f \
+                     \( -name 'Workflow.json' -o -name 'project.json' -o -name 'uipath.json' \
+                     -o -name 'agent.json' -o -name 'entry-points.json' \) | sort)
+
+          # Runnability. `uip api-workflow validate` checks the SHAPE of the file:
+          # to it a `<TODO: ...>` connection id is a valid string and an invented
+          # connector is a well-formed object, so a workflow that cannot possibly
+          # run passes it clean. validate-build.sh makes the checks it cannot -
+          # unresolved placeholders, connector keys and connection ids that are not
+          # in architectural-considerations.md §4, and activities that are not the
+          # HTTP-Request-with-connector-authentication shape §4 approves. No-ops when the build
+          # produced no Workflow.json, so it is safe for every product.
+          if [ -f .github/scripts/validate-build.sh ]; then
+            echo "=== validate-build.sh ===" | tee -a "$LOG"
+            bash .github/scripts/validate-build.sh "$CODE_DIR" \
+              "$DOCS_DIR/architectural-considerations.md" 2>&1 | tee -a "$LOG" || RC=1
+          else
+            echo "::warning::.github/scripts/validate-build.sh is missing - runnability not checked" | tee -a "$LOG"
+          fi
+
+          # Deploy readiness. Packing is the only offline proof that uipath-deploy will
+          # be able to publish this - a project can validate and run and still fail to
+          # pack (missing solution registration, bad version, unresolved resource).
+          # Product-agnostic: pack whatever solution the build produced.
+          PACKED=0
+          while IFS= read -r sol; do
+            [ -n "$sol" ] || continue
+            PACKED=1
+            echo "=== uip solution pack (in $sol) ===" | tee -a "$LOG"
+            # Output OUTSIDE $CODE_DIR: "Commit test fixes" runs `git add $CODE_DIR`,
+            # so a ./build here would commit the package to the branch.
+            ( cd "$sol" && uip solution pack . "$RUNNER_TEMP/packcheck" \
+                --name "$(basename "$sol")" --version 0.0.1 --output json ) 2>&1 \
+              | tee -a "$LOG" || { echo "::error::solution pack failed in $sol" | tee -a "$LOG"; RC=1; }
+          done < <(find "$CODE_DIR" -maxdepth 3 -type f -name '*.uipx' -exec dirname {} \; | sort -u)
+          if [ "$PACKED" -eq 0 ]; then
+            # Not a warning. A silent pass here is exactly how a project-only build
+            # reached review with its deploy path never tested.
+            echo "::error::no .uipx under $CODE_DIR - every build ships as a solution, so there is nothing to prove deploy readiness with" | tee -a "$LOG"
+            RC=1
+          fi
+
+          if grep -qiE "unknown command|unknown option" "$LOG"; then
+            echo "::warning::The CLI rejected a verb - surface has drifted. The agent will discover the right one."
+            RC=1
+          fi
+          echo "validate_rc=$RC" >> "$GITHUB_OUTPUT"
+          exit "$RC"
+
+      - name: Repair and test
+        if: steps.validate.outcome == 'failure'
+        uses: anthropics/claude-code-base-action@beta
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          model: ${{ env.AGENT_MODEL }}
+          timeout_minutes: '20'
+          allowed_tools: "Read,Edit,MultiEdit,Glob,Grep,Bash,Skill"
+          prompt: |
+            You are a REPAIR agent, not a developer. The project under
+            ${{ env.CODE_DIR }}/ was already built and reviewed against the SDD. One or
+            more mechanical checks failed. Fix ONLY what the checks report.
+
+            Test log:      ${{ env.WORK_DIR }}/test-log.txt
+            Primary:       ${{ needs.identify.outputs.product }}
+            Build skills:  ${{ needs.identify.outputs.skills }}
+
+            ## Your only job
+
+            Make these three things pass, in this order:
+
+            1. **Structurally sound** - the product's `validate` command is clean.
+            2. **Runnable** - `validate-build.sh` is clean. It reports things the
+               shape validator cannot see: a `<TODO: ...>` left in a connection or
+               activity id, a connector key or connection id that is not in
+               `architectural-considerations.md` §4, or an activity that is not the
+               shape §4 approves - the HTTP Request activity with
+               `authentication: "connector"`, which §4 carries verbatim with both a
+               Coupa and a Slack example. Every message names
+               the activity and what to write instead - that is the whole fix. The
+               connection ids come from the §4 table; if the value you need is not
+               there, stop and record it, do not invent one.
+            3. **Packs** - `uip solution pack` succeeds (this is the deploy gate).
+
+            There is deliberately no local-run gate. `--no-auth` has no Integration
+            Service credentials, so a connector-authenticated call always fails with
+            `baseUrl is required and cannot be empty` no matter how correct the
+            workflow is. If you see that error in an old log, it is not a defect -
+            do not chase it, and never weaken a connector activity to make a local
+            run succeed.
+            5. Nothing else. An activity-count WARNING is not yours to fix -
+               the size of the design is the PDD's business, not a repair job.
+
+            ## Scope - read this twice
+
+            - **Start from the test log, not from the design.** The log names the failing
+              file, check and message. That is your entire brief.
+            - **Do NOT read the SDD, the architecture json, or the task list.** They are
+               deliberately not listed above. The design decisions are settled; you are
+               not re-deriving them. If a failure genuinely cannot be fixed without a
+               design decision, STOP, leave it, and record it in the build notes for a
+               human - do not decide it yourself.
+            - **Do NOT add features, business rules, activities, eval sets or test
+              cases.** Authoring tests is the Build stage's job. If coverage is thin,
+              say so in the build notes; do not write it here.
+            - **Do NOT restructure, reformat or "improve" anything that already passes.**
+              A file the checks did not complain about is not yours to touch.
+            - **Smallest possible diff.** You have Edit/MultiEdit and no Write tool, on
+              purpose: patch the broken fields. Never delete and regenerate a file.
+
+            ## How to fix
+
+            - Read ONLY the file(s) the log names, and only the regions that matter -
+              use Grep to find the failing key rather than reading a large file whole.
+            - Consult `~/.claude/skills/<skill-name>/SKILL.md` for a skill in Build
+              skills ONLY when the log shows a product-specific shape error you cannot
+              fix from the message alone. Do not read skills pre-emptively. Never use
+              the Task tool: subagent spawns fail in this runner with a 404 on a retired
+              model id.
+            - If the log shows `unknown command` or `unknown option`, the CLI surface has
+              drifted: discover the supported verbs with `uip <group> --help` and use
+              those. NEVER invent a command.
+            - Re-run the failing check after each fix until it is clean. Do not weaken
+              the implementation to make a check pass - if the only way through is to
+              remove behaviour, stop and report it instead.
+
+            ## Then
+
+            Append a short `## Test repair` section to ${{ env.CODE_DIR }}/build-notes.md:
+            what failed, the exact change you made, and anything you deliberately left
+            for a human. Keep it to a few lines - this is a repair log, not a report.
+
+            Do NOT run `uip login` or anything needing a tenant - there are no credentials
+            here. Do NOT modify ${{ env.DOCS_DIR }}/. Do NOT run git or gh.
+
+      - name: Re-validate after repair
+        id: revalidate
+        if: steps.validate.outcome == 'failure'
+        continue-on-error: ${{ inputs.skip_tests == true }}
+        run: |
+          set -uo pipefail
+          PRODUCT="${{ needs.identify.outputs.product }}"
+          RC=0
+          run_in_projects() {
+            local marker="$1"; shift
+            while IFS= read -r d; do
+              [ -n "$d" ] || continue
+              echo "=== $* (in $d) ==="
+              ( cd "$d" && "$@" ) 2>&1 || RC=1
+            done < <(find "$CODE_DIR" -maxdepth 3 -type f -name "$marker" -exec dirname {} \; | sort -u)
+          }
+          case "$PRODUCT" in
+            # validate takes the workflow FILE, not the project directory.
+            # Mirror the first pass exactly - the repair agent is told the gate is
+            # validate + validate-build.sh + pack, so re-validating less than that
+            # would let a project through that the first pass had rejected.
+            api-workflows)
+              # NO `uip api-workflow run` here. `--no-auth` means no Integration
+              # Service credentials and no connection context, so any HTTP Request
+              # with `authentication: "connector"` dies on `baseUrl is required and
+              # cannot be empty` however correct the workflow is. It is an
+              # unsatisfiable gate for every design that calls a connector, and it
+              # cost a repair round-trip that fixed the real defect and still failed.
+              # build + validate + validate-build.sh + `uip solution pack` is the
+              # offline gate; a live run belongs to deploy, where credentials exist.
+              run_in_projects 'project.uiproj' bash -c '
+                MAIN=$(python3 -c "import json;print(json.load(open(\"project.uiproj\")).get(\"MainFile\") or \"Workflow.json\")")
+                uip api-workflow build . &&
+                uip api-workflow validate "$MAIN"
+              '
+              ;;
+            rpa-process|rpa-library|rpa-test-automation)
+                             run_in_projects 'project.json' uip rpa build ;;
+            maestro-flow)    run_in_projects 'project.json' uip maestro flow validate ;;
+            maestro-bpmn)    run_in_projects 'project.json' uip maestro bpmn validate ;;
+            case-management) run_in_projects 'project.uiproj' uip maestro case validate ;;
+            agents)          run_in_projects 'agent.json' uip agent pack --output-dir /tmp/agentpack2 ;;
+            coded-apps)      run_in_projects 'package.json' npm run build ;;
+          esac
+
+          # Runnability, same check that caught the defect on the first pass. Without
+          # it the re-validate pass never confirms the repair actually landed.
+          if [ -f .github/scripts/validate-build.sh ]; then
+            echo "=== validate-build.sh ==="
+            bash .github/scripts/validate-build.sh "$CODE_DIR" \
+              "$DOCS_DIR/architectural-considerations.md" 2>&1 || RC=1
+          fi
+
+          # Deploy readiness, same gate as the first pass.
+          PACKED=0
+          while IFS= read -r sol; do
+            [ -n "$sol" ] || continue
+            PACKED=1
+            echo "=== uip solution pack (in $sol) ==="
+            ( cd "$sol" && uip solution pack . "$RUNNER_TEMP/packcheck2" \
+                --name "$(basename "$sol")" --version 0.0.1 --output json ) 2>&1 \
+              || { echo "::error::solution pack still fails in $sol"; RC=1; }
+          done < <(find "$CODE_DIR" -maxdepth 3 -type f -name '*.uipx' -exec dirname {} \; | sort -u)
+          if [ "$PACKED" -eq 0 ]; then
+            echo "::error::still no .uipx under $CODE_DIR after the repair pass"
+            RC=1
+          fi
+
+          if [ "$RC" -ne 0 ]; then
+            echo "::error::The project still does not validate after one repair pass."
+            exit 1
+          fi
+          echo "Project validates, packs and runs."
+
+      - name: Commit test fixes
+        run: |
+          set -euo pipefail
+          git config user.name  "uipath-developer[bot]"
+          git config user.email "uipath-developer[bot]@users.noreply.github.com"
+          git add "$CODE_DIR"
+          if git diff --cached --quiet; then
+            echo "Nothing to commit - no repair was needed."
+          else
+            git commit -m "test: fix ${{ needs.identify.outputs.story_key }} validation" \
+                       -m "Repaired by uipath-developer after the Test job."
+            git push origin "HEAD:${{ needs.identify.outputs.branch }}"
+          fi
+
+      - name: Test summary
+        if: always()
+        run: |
+          {
+            echo "### 4. Test"
+            echo ""
+            echo "Gate: structurally valid → packs → runs clean. No re-implementation."
+            echo ""
+            echo "| Check | Result |"
+            echo "| --- | --- |"
+            echo "| First pass (validate + pack + run) | ${{ steps.validate.outcome }} |"
+            echo "| Repair pass | ${{ steps.validate.outcome == 'failure' && 'ran' || 'not needed' }} |"
+            echo "| Re-validate | ${{ steps.revalidate.outcome || 'skipped - first pass was clean' }} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Observe - Development done
+        # A dashboard write must never fail the pipeline: observe.sh uses `set -e`, so
+        # a rate limit or a transient 5xx would otherwise take a good stage down with it.
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO:     ${{ github.repository }}
+        run: |
+          # Code written and tests green - Development is complete. Testing stays
+          # in-progress until uipath-review decides, so the row only moves forward.
+          bash .github/scripts/observe.sh stage Development status=done
+
+  # ═══════════════════════════════════════════════════════════════
+  # 5. Open PR
+  # The Maestro resume signal, and the surface uipath-review.yml reviews.
+  # No auto-merge - the human merge is the approval.
+  # ═══════════════════════════════════════════════════════════════
+
+  open-pr:
+    name: Open PR
+    needs: [identify, test]
+    runs-on: ubuntu-latest
+    outputs:
+      pr_number: ${{ steps.pr.outputs.pr_number }}
+      pr_url:    ${{ steps.pr.outputs.pr_url }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.identify.outputs.branch }}
+          fetch-depth: 1
+
+      - name: Open PR into develop
+        id: pr
+        env:
+          # The ONE place a PAT is required. GitHub refuses to start a workflow from
+          # an event raised by GITHUB_TOKEN, so a bot-authored PR never triggers
+          # uipath-review - the run is either not created or parked behind an
+          # approval gate that expires unapproved. A PAT makes this PR human-authored
+          # and the review fires normally.
+          #
+          # The fallback is intentional: with the secret unset the chain still runs,
+          # it just stops reviewing itself. That is a degraded mode, not a failure,
+          # so it must not break the build - but check the secret if reviews go quiet.
+          GH_TOKEN:  ${{ secrets.DEV_PR_AUTHOR_PAT || secrets.GITHUB_TOKEN }}
+          REPO:      ${{ github.repository }}
+          BRANCH:    ${{ needs.identify.outputs.branch }}
+          STORY_KEY: ${{ needs.identify.outputs.story_key }}
+          ARCH_FILE: ${{ needs.identify.outputs.arch_file }}
+        run: |
+          set -euo pipefail
+
+          BLOB="${{ github.server_url }}/$REPO/blob/$BRANCH"
+          if [ -f "$ARCH_FILE" ]; then
+            PROCESS=$(python3 -c "import json;print(json.load(open('$ARCH_FILE'))['process_name'])")
+          else
+            PROCESS="$STORY_KEY"
+          fi
+          TITLE_LINE="implement $PROCESS (${{ needs.identify.outputs.product }})"
+
+          EXISTING=$(gh pr list --repo "$REPO" --head "$BRANCH" --base "$BASE_BRANCH" \
+                       --state open --json number --jq '.[0].number' || echo "")
+
+          cat > /tmp/pr-body.md <<'EOF_BODY'
+          ## Implementation for review
+
+          The developer agent built this from the approved SDD, then the Test job validated
+          it. Merging this PR approves the implementation and advances the case.
+
+          **Review checklist**
+          - [ ] Every SDD business rule is actually implemented
+          - [ ] Queue / argument / entity schemas match the SDD
+          - [ ] Orchestrator resource names match the SDD exactly
+          - [ ] Everything under *Left for a human* in `build-notes.md` is acceptable
+          - [ ] Tests cover the happy path and each business exception
+          EOF_BODY
+
+          {
+            echo ""
+            if [ -f "$CODE_DIR/build-notes.md" ]; then
+              echo "<details><summary><b>build-notes.md</b></summary>"
+              echo ""
+              cat "$CODE_DIR/build-notes.md"
+              echo ""
+              echo "</details>"
+              echo ""
+            fi
+            echo "| | |"
+            echo "| --- | --- |"
+            echo "| Story | \`$STORY_KEY\` |"
+            echo "| Architecture | [\`$ARCH_FILE\`]($BLOB/$ARCH_FILE) |"
+            echo "| Scope / product | \`${{ needs.identify.outputs.scope }}\` / \`${{ needs.identify.outputs.product }}\` |"
+            echo "| Build skills | \`${{ needs.identify.outputs.skills }}\` |"
+            echo ""
+            for f in ${{ needs.identify.outputs.sdd_files }}; do
+              echo "- SDD: [\`$f\`]($BLOB/$f)"
+            done
+            echo ""
+            echo "<sub>Generated by \`uipath-develop\` - run [${{ github.run_id }}](${{ github.server_url }}/$REPO/actions/runs/${{ github.run_id }})</sub>"
+          } >> /tmp/pr-body.md
+
+          if [ -n "$EXISTING" ] && [ "$EXISTING" != "null" ]; then
+            echo "PR #$EXISTING already open for $BRANCH - updating it."
+            gh pr edit "$EXISTING" --repo "$REPO" \
+              --title "feat: $TITLE_LINE" --body-file /tmp/pr-body.md
+            PR_NUMBER="$EXISTING"
+          else
+            gh pr create --repo "$REPO" \
+              --base "$BASE_BRANCH" --head "$BRANCH" \
+              --title "feat: $TITLE_LINE" --body-file /tmp/pr-body.md
+            PR_NUMBER=$(gh pr list --repo "$REPO" --head "$BRANCH" --base "$BASE_BRANCH" \
+                          --state open --json number --jq '.[0].number')
+          fi
+
+          if [ -z "$PR_NUMBER" ] || [ "$PR_NUMBER" = "null" ]; then
+            echo "::error::PR from $BRANCH into $BASE_BRANCH was not created. Maestro will not resume."
+            exit 1
+          fi
+
+          PR_URL=$(gh pr view "$PR_NUMBER" --repo "$REPO" --json url --jq .url)
+          echo "pr_number=$PR_NUMBER" >> "$GITHUB_OUTPUT"
+          echo "pr_url=$PR_URL"       >> "$GITHUB_OUTPUT"
+          {
+            echo "### 5. PR opened"
+            echo ""
+            echo "[#$PR_NUMBER - feat: $TITLE_LINE]($PR_URL) into \`$BASE_BRANCH\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ═══════════════════════════════════════════════════════════════
+  # 6. Assign PR
+  # ═══════════════════════════════════════════════════════════════
+  assign-pr:
+    name: Assign PR
+    needs: [identify, open-pr]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Assign and request review
+        env:
+          GH_TOKEN:  ${{ secrets.DEV_PR_AUTHOR_PAT || secrets.GITHUB_TOKEN }}
+          REPO:      ${{ github.repository }}
+          PR_NUMBER: ${{ needs.open-pr.outputs.pr_number }}
+          PR_URL:    ${{ needs.open-pr.outputs.pr_url }}
+        run: |
+          set -euo pipefail
+          gh pr edit "$PR_NUMBER" --repo "$REPO" --add-assignee "$ASSIGNEE"
+          echo "Assigned PR #$PR_NUMBER to $ASSIGNEE."
+
+          if gh pr edit "$PR_NUMBER" --repo "$REPO" --add-reviewer "$ASSIGNEE" 2>/dev/null; then
+            echo "Requested review from $ASSIGNEE."
+          else
+            echo "::notice::Review not requested from $ASSIGNEE (likely the PR author). Assignee is set."
+          fi
+          {
+            echo "### 6. PR assigned"
+            echo ""
+            echo "[#$PR_NUMBER]($PR_URL) assigned to \`$ASSIGNEE\`. \`uipath-review\` reviews it and merges on approval."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/checkout@v4
+        with:
+          ref: develop
+          sparse-checkout: .github/scripts
+          fetch-depth: 1
+
+      - name: Observe - Testing in review
+        # A dashboard write must never fail the pipeline: observe.sh uses `set -e`, so
+        # a rate limit or a transient 5xx would otherwise take a good stage down with it.
+        continue-on-error: true
+        env:
+          GH_TOKEN:  ${{ secrets.GITHUB_TOKEN }}
+          REPO:      ${{ github.repository }}
+          PR_NUMBER: ${{ needs.open-pr.outputs.pr_number }}
+          PR_URL:    ${{ needs.open-pr.outputs.pr_url }}
+        run: |
+          # The gate moves to Testing the moment the PR exists, so the bubble is
+          # already amber when uipath-review picks it up. Development stays done.
+          bash .github/scripts/observe.sh stage Testing status=in-review decidedBy=agent \
+            pr="$PR_NUMBER" prUrl="$PR_URL"
+
+          # Keep the implementation PR reachable from the Development card too.
+          bash .github/scripts/observe.sh stage Development \
+            pr="$PR_NUMBER" prUrl="$PR_URL"
+
+  # ═══════════════════════════════════════════════════════════════
+  # Fault
+  # Without this a crashed run leaves the stage on `in-progress` and the card
+  # spins for ever. Runs only when a job above actually failed - a skipped job
+  # does not count as a failure.
+  # ═══════════════════════════════════════════════════════════════
+  faulted:
+    name: Record fault
+    needs: [identify, derive-tasks, build, test, open-pr, assign-pr]
+    if: failure()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: develop
+          sparse-checkout: .github/scripts
+          fetch-depth: 1
+
+      - name: Observe - Attribute the fault
+        # A dashboard write must never fail the pipeline: observe.sh uses `set -e`, so
+        # a rate limit or a transient 5xx would otherwise take a good stage down with it.
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO:     ${{ github.repository }}
+        run: |
+          # Development is the code being written - identify, derive-tasks, build.
+          # Testing is a separate job in this same workflow. Once build is green the
+          # automation exists, so a red test run must paint Testing red and leave
+          # Development done, rather than dragging both bubbles down together.
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+          DEV_FAILED=0
+          if [ "${{ needs.identify.result }}" = "failure" ] \
+             || [ "${{ needs['derive-tasks'].result }}" = "failure" ] \
+             || [ "${{ needs.build.result }}" = "failure" ]; then
+            DEV_FAILED=1
+          fi
+
+          if [ "$DEV_FAILED" = "1" ]; then
+            bash .github/scripts/observe.sh stage Development status=faulted \
+              task="The development run failed" \
+              run=${{ github.run_id }} runUrl="$RUN_URL"
+          else
+            # The code was written and built; whatever failed came after it.
+            bash .github/scripts/observe.sh stage Development status=done
+          fi
+
+          if [ "${{ needs.test.result }}" = "failure" ]; then
+            bash .github/scripts/observe.sh stage Testing status=faulted \
+              task="Tests failed" \
+              run=${{ github.run_id }} runUrl="$RUN_URL"
+          fi
