@@ -15,8 +15,8 @@
       "story": "JACTIV-725"
     },
     "Architecture": {
-      "status": "in-review",
-      "updatedAt": "2026-09-22T21:42:55Z",
+      "status": "done",
+      "updatedAt": "2026-09-22T21:43:11Z",
       "task": "Determining architecture",
       "run": 35787950623,
       "decidedBy": "auto",
