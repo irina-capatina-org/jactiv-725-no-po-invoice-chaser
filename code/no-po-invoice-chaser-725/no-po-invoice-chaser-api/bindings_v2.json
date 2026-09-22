@@ -1,0 +1,43 @@
+{
+  "version": "2.0",
+  "resources": [
+    {
+      "resource": "Connection",
+      "key": "5fadfc73-a372-46ae-a27c-2481741eed07",
+      "activityId": "HTTP_Request_Coupa",
+      "activityDisplayName": "HTTP Request: Coupa",
+      "value": {
+        "ConnectionId": {
+          "defaultValue": "5fadfc73-a372-46ae-a27c-2481741eed07",
+          "isExpression": false
+        }
+      },
+      "metadata": {
+        "UseConnectionService": "true",
+        "Connector": "uipath-coupa-coupa",
+        "ActivityName": "HTTP Request: Coupa",
+        "BindingsVersion": "2.2",
+        "SolutionsSupport": "true"
+      }
+    },
+    {
+      "resource": "Connection",
+      "key": "43d506f7-7de2-4798-aac1-9522e2e45dbb",
+      "activityId": "HTTP_Request_Slack",
+      "activityDisplayName": "HTTP Request: Slack",
+      "value": {
+        "ConnectionId": {
+          "defaultValue": "43d506f7-7de2-4798-aac1-9522e2e45dbb",
+          "isExpression": false
+        }
+      },
+      "metadata": {
+        "UseConnectionService": "true",
+        "Connector": "uipath-salesforce-slack",
+        "ActivityName": "HTTP Request: Slack",
+        "BindingsVersion": "2.2",
+        "SolutionsSupport": "true"
+      }
+    }
+  ]
+}

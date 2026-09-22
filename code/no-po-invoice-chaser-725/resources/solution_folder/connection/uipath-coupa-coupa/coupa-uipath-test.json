@@ -1,0 +1,28 @@
+{
+  "docVersion": "1.0.0",
+  "resource": {
+    "name": "coupa-uipath-test",
+    "kind": "connection",
+    "type": "uipath-coupa-coupa",
+    "apiVersion": "integrationservice.uipath.com/v1",
+    "isOverridable": true,
+    "dependencies": [],
+    "runtimeDependencies": [],
+    "folders": [
+      {
+        "fullyQualifiedName": "solution_folder"
+      }
+    ],
+    "spec": {
+      "connectorName": "Coupa",
+      "name": "coupa-uipath-test",
+      "authenticationType": "AuthenticateAfterDeployment",
+      "connectorVersion": "1.4.44",
+      "connectorKey": "uipath-coupa-coupa",
+      "pollingInterval": 5
+    },
+    "locks": [],
+    "key": "5fadfc73-a372-46ae-a27c-2481741eed07",
+    "files": []
+  }
+}
