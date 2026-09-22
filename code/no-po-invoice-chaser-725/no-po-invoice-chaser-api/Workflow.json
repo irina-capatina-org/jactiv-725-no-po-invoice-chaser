@@ -352,7 +352,7 @@
                               "method": "POST",
                               "path": "chat.postMessage",
                               "url": "chat.postMessage",
-                              "body": "${$context.variables.slackPayload}"
+                              "body": "${{ { channel: 'WLX9BD8FN', text: `:receipt: ${$context.variables.qualifyingCount} invoices from the last seven days have no purchase order linked`, blocks: [ { type: 'header', text: { type: 'plain_text', text: `:receipt: ${$context.variables.qualifyingCount} invoices need a purchase order`, emoji: true } }, { type: 'section', text: { type: 'mrkdwn', text: `:warning:  *${$context.variables.qualifyingCount} invoices* from the last seven days have no purchase order linked.\n:no_entry:  An invoice without a linked PO cannot be matched or paid under our *no-PO-no-pay policy*, and payment to the supplier stalls until it is fixed.\n:point_right:  Please make sure a purchase order exists for these invoices and is correctly linked to each one.` } }, { type: 'actions', elements: [ { type: 'button', text: { type: 'plain_text', text: 'Open the list in Coupa', emoji: true }, url: $context.variables.coupaUrl, style: 'primary' } ] }, { type: 'divider' }, { type: 'context', elements: [ { type: 'mrkdwn', text: `:calendar: Invoices dated *${$context.variables.windowStart}* to *${$context.variables.windowEnd}*  ·  :robot_face: No-PO Invoice Chaser  ·  checked *${$context.variables.runDate}*` } ] } ] } }}"
                             }
                           },
                           "export": {

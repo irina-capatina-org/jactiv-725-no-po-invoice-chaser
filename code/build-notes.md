@@ -45,6 +45,14 @@ None. All eight steps from SDD §4, all business rules (BR-01 through BR-10), bo
 | Live integration test (T-01 to T-S6) | — | §8 Testing Strategy | Requires live IS credentials for Coupa and Slack. Left for Test stage. |
 | Orchestrator time trigger | — | §1 Invocation pattern, §7 Environments | Weekdays 10:00 Europe/Bucharest schedule; left for deploy stage (Task T5). |
 
+## Test repair
+
+**What failed:** `validate-build.sh` reported `HTTP_Request_Slack: the chat.postMessage body has no \`blocks\`` — the check scans `bodyParameters.body` for the literal string `blocks` and found only a variable reference (`"${$context.variables.slackPayload}"`), which it cannot introspect.
+
+**Exact change:** `Workflow.json` line 355 — replaced `"body": "${$context.variables.slackPayload}"` with an inline `${{ }}` expression containing the full Block Kit payload (`channel`, `text`, `blocks`) referencing the already-set workflow variables (`qualifyingCount`, `windowStart`, `windowEnd`, `runDate`, `coupaUrl`). The `Javascript_ComposeSlackPayload` script and `slackPayload` variable are now unused by the Slack activity but left in place (they are not broken and removing them is outside repair scope).
+
+**Left for a human:** The `slackPayload` variable and its Assign step are now dead code — the body is built inline from the individual variables. A developer may remove `Javascript_ComposeSlackPayload`, `Assign_SlackPayload`, and the `slackPayload` variable declaration if desired; doing so would also bring the activity count closer to §8's budget.
+
 ## How to Test This
 
 ```bash
