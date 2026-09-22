@@ -40,8 +40,9 @@
       "prUrl": "https://github.com/irina-capatina-org/jactiv-725-no-po-invoice-chaser/pull/3"
     },
     "Documentation": {
-      "status": "todo",
-      "updatedAt": null
+      "status": "in-progress",
+      "updatedAt": "2026-09-22T21:58:52Z",
+      "task": "Writing the as-built DSD"
     },
     "Production": {
       "status": "todo",
