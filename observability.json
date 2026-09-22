@@ -15,10 +15,13 @@
       "story": "JACTIV-725"
     },
     "Architecture": {
-      "status": "in-progress",
-      "updatedAt": "2026-09-22T21:39:46Z",
+      "status": "in-review",
+      "updatedAt": "2026-09-22T21:42:55Z",
       "task": "Determining architecture",
-      "run": 35787950623
+      "run": 35787950623,
+      "decidedBy": "auto",
+      "pr": 2,
+      "prUrl": "https://github.com/irina-capatina-org/jactiv-725-no-po-invoice-chaser/pull/2"
     },
     "Development": {
       "status": "todo",
