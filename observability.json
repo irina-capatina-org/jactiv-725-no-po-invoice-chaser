@@ -33,8 +33,8 @@
     },
     "Testing": {
       "status": "in-review",
-      "updatedAt": "2026-09-22T21:55:18Z",
-      "task": "Running tests",
+      "updatedAt": "2026-09-22T21:55:29Z",
+      "task": "The review agent is reviewing the implementation",
       "decidedBy": "agent",
       "pr": 3,
       "prUrl": "https://github.com/irina-capatina-org/jactiv-725-no-po-invoice-chaser/pull/3"
