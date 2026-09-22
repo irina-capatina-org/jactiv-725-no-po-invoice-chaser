@@ -15,8 +15,9 @@
       "story": "JACTIV-725"
     },
     "Architecture": {
-      "status": "todo",
-      "updatedAt": null
+      "status": "in-progress",
+      "updatedAt": "2026-09-22T21:39:33Z",
+      "task": "Designing the solution"
     },
     "Development": {
       "status": "todo",
